@@ -991,8 +991,29 @@ def run(args):
         }
         evaluator_context = 0
 
-    eval_root = results_dir / "evaluation" / datetime.now().astimezone().strftime("run-%Y%m%d-%H%M%S")
-    eval_root.mkdir(parents=True, exist_ok=False)
+    # Evaluation runs are explicit: create a new run by default, or resume
+    # exactly the run selected with --resume. Never guess between multiple
+    # incomplete evaluations.
+    evaluation_root = results_dir / "evaluation"
+    evaluation_root.mkdir(parents=True, exist_ok=True)
+    eval_root: Path
+
+    if args.resume:
+        eval_root = Path(args.resume).expanduser().resolve()
+        if not eval_root.is_dir():
+            raise RuntimeError(f"Resume path does not exist or is not a directory: {eval_root}")
+        if not eval_root.is_relative_to(evaluation_root):
+            raise RuntimeError(
+                f"Resume path must be inside the results evaluation directory {evaluation_root}: {eval_root}"
+            )
+        resuming = True
+    else:
+        eval_root = evaluation_root / datetime.now().astimezone().strftime("run-%Y%m%d-%H%M%S")
+        eval_root.mkdir(parents=True, exist_ok=False)
+        resuming = False
+
+    if resuming:
+        print(f"Resuming evaluation: {eval_root}")
 
     print("=" * 70)
     print(" EPUB LLM SUMMARY EVALUATION")
@@ -1020,6 +1041,7 @@ def run(args):
         "temperature": args.temperature,
         "reasoning": args.reasoning,
         "base_url": args.base_url,
+        "resumed": resuming,
     })
 
     all_reference_facts: dict[str, list[dict]] = {}
@@ -1029,8 +1051,24 @@ def run(args):
     # Phase 1: reference fact extraction.
     print("Phase 1/3: building importance-tagged reference facts...")
     ref_dir = eval_root / "reference"
-    ref_dir.mkdir()
+    ref_dir.mkdir(parents=True, exist_ok=True)
     for pos, chapter in enumerate(chapters, 1):
+        ref_path = ref_dir / (f"{int(chapter.number):03d}.json" if chapter.number.isdigit() else "epilogue.json")
+        if resuming and ref_path.exists():
+            try:
+                cached = read_json(ref_path)
+                cached_facts = cached.get("facts")
+                if isinstance(cached_facts, list):
+                    all_reference_facts[chapter.number] = cached_facts
+                    cached_usage = cached.get("usage") or {}
+                    reference_elapsed += float(cached.get("elapsed_seconds", 0) or 0)
+                    ref_prompt_tokens += int(cached_usage.get("prompt_tokens", 0) or 0)
+                    ref_completion_tokens += int(cached_usage.get("completion_tokens", 0) or 0)
+                    print(f"  [{pos:02d}/{len(chapters)}] {chapter.title}: {len(cached_facts)} facts [CACHED]")
+                    continue
+            except Exception:
+                pass
+
         reference_section = reference_sections.get(chapter.number, "")
         if not reference_section:
             print(f"  [{pos:02d}/{len(chapters)}] {chapter.title}: no matching NotebookLM section")
@@ -1088,7 +1126,7 @@ def run(args):
         model_key = book_info.get("model", run_dir.parent.name)
         label = f"{run_dir.parent.name}/{run_dir.name}"
         model_out = eval_root / safe_name(run_dir.parent.name) / run_dir.name
-        model_out.mkdir(parents=True)
+        model_out.mkdir(parents=True, exist_ok=True)
         chapter_summaries = read_model_chapter_summaries(run_dir, chapters)
         chapter_results = []
         total_eval_elapsed = 0.0
@@ -1096,6 +1134,21 @@ def run(args):
 
         print(f"\n  [{run_index}/{len(runs)}] {label}")
         for pos, chapter in enumerate(chapters, 1):
+            result_path = model_out / (f"{int(chapter.number):03d}.json" if chapter.number.isdigit() else "epilogue.json")
+            if resuming and result_path.exists():
+                try:
+                    cached_result = read_json(result_path)
+                    if isinstance(cached_result, dict) and "fact_results" in cached_result and "model_claims" in cached_result:
+                        chapter_results.append(cached_result)
+                        cached_usage = cached_result.get("usage") or {}
+                        total_eval_elapsed += float(cached_result.get("elapsed_seconds", 0) or 0)
+                        total_eval_prompt += int(cached_usage.get("prompt_tokens", 0) or 0)
+                        total_eval_completion += int(cached_usage.get("completion_tokens", 0) or 0)
+                        print(f"    [{pos:02d}/{len(chapters)}] {chapter.title} [CACHED]")
+                        continue
+                except Exception:
+                    pass
+
             facts = all_reference_facts.get(chapter.number, [])
             summary = chapter_summaries.get(chapter.number, "")
             if not summary:
@@ -1166,6 +1219,17 @@ def run(args):
     facts_text = json.dumps(flat_facts, ensure_ascii=False, indent=2)
     for item in model_reports:
         run_dir = Path(item["run_dir"])
+        book_eval_path = eval_root / safe_name(Path(item["run_dir"]).parent.name) / Path(item["run_dir"]).name / "book_evaluation.json"
+        if resuming and book_eval_path.exists():
+            try:
+                cached_book = read_json(book_eval_path)
+                if isinstance(cached_book, dict) and "result" in cached_book:
+                    book_level.append(cached_book)
+                    print(f"  {item['label']} [CACHED]")
+                    continue
+            except Exception:
+                pass
+
         summary = read_book_summary(run_dir)
         if not summary:
             continue
@@ -1244,6 +1308,11 @@ def main():
     parser.add_argument("--max-tokens-book-eval", type=int, default=4096, help="Max tokens for complete-book evaluation")
     parser.add_argument("--min-output-tokens", type=int, default=2048)
     parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument(
+        "--resume",
+        metavar="PATH",
+        help="Resume exactly the evaluation run at PATH. Already completed phases/chapters are reused.",
+    )
     args = parser.parse_args()
     try:
         run(args)

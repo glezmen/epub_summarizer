@@ -117,11 +117,13 @@ http://localhost:1234/api/v1/models
 
 It selects the LLM with a non-empty `loaded_instances` list and reads the effective `context_length` from the loaded instance. If multiple LLM instances are loaded, the script stops instead of guessing.
 
-Actual generation uses LM Studio's OpenAI-compatible endpoint:
+Actual generation uses LM Studio's native REST API:
 
 ```text
-http://localhost:1234/v1/chat/completions
+http://localhost:1234/api/v1/chat
 ```
+
+The native API is used because it exposes reasoning as a first-class request option and returns inference statistics such as input tokens, output tokens, reasoning tokens and generation speed.
 
 ### Basic usage
 
@@ -163,18 +165,35 @@ Reasoning is disabled by default and is recommended for the baseline summarizati
 --reasoning off
 ```
 
-The script translates `off` to LM Studio's API value `none`.
+The script queries the loaded model's supported reasoning settings through LM Studio's native API.
 
-Other modes are:
+Supported native settings are:
 
 ```text
+off
 low
 medium
 high
-xhigh
+on
 ```
 
-`on` is accepted and maps to `high`.
+If the requested mode is not supported by the loaded model, the script can select a supported effective mode. This matters for models such as DeepSeek R1, which may report only:
+
+```text
+Supported settings: 'on'
+```
+
+In that case a request for `off` cannot be honored literally; the benchmark records both the requested and effective reasoning settings.
+
+Reasoning statistics returned by LM Studio are also preserved, including:
+
+```text
+reasoning_output_tokens
+tokens_per_second
+time_to_first_token_seconds
+```
+
+For reasoning models, reasoning tokens consume the output-token budget. The benchmark therefore gives reasoning-capable models additional output-token headroom to reduce failures where the model exhausts the budget while still reasoning and produces no final answer.
 
 ### Temperature
 
@@ -296,7 +315,7 @@ Default:
 python3 evaluate_summaries.py book.epub notebooklm_summary.md results
 ```
 
-The evaluator automatically detects the loaded LM Studio LLM in the same way as the benchmark script.
+The evaluator automatically detects the loaded LM Studio LLM in the same way as the benchmark script. The generation benchmark itself uses LM Studio's native `/api/v1/chat` API.
 
 #### Claude Code evaluator
 
@@ -311,7 +330,7 @@ python3 evaluate_summaries.py \
   --evaluator-model opus
 ```
 
-`opus` is the default Claude Code model alias for this backend; `sonnet` can also be selected when supported by the installed Claude Code version.
+`haiku`, `sonnet`, and `opus` can be selected when supported by the installed Claude Code version. For high-volume structured fact evaluation, `haiku` is a useful lower-cost option; keep the evaluator model fixed when comparing benchmark runs.
 
 This uses the local `claude` CLI and therefore uses the Claude Code authentication available on the machine. A Claude web subscription and Anthropic API access are separate mechanisms; this backend specifically uses the authenticated Claude Code CLI.
 
@@ -405,15 +424,54 @@ The final report includes, where available:
 - model variant and quantization;
 - parameter information reported by LM Studio;
 - context length;
-- reasoning mode;
+- requested and effective reasoning mode;
+- supported reasoning settings reported by LM Studio;
 - temperature;
 - output-token settings;
 - total and per-chapter runtime;
 - input/output token usage;
+- reasoning token usage;
+- inference speed and time-to-first-token when reported by LM Studio;
 - evaluator provider and model;
 - evaluator configuration.
 
 This allows quality to be considered together with generation cost/time rather than using a single quality score in isolation.
+
+## Evaluation runs and resume
+
+Every evaluation gets its own timestamped directory.
+
+Without `--resume`, the evaluator always creates a **new** evaluation run. It does not automatically search for the latest incomplete run.
+
+To continue a specific existing evaluation, explicitly provide:
+
+```bash
+--resume results/evaluation/run-YYYYMMDD-HHMMSS
+```
+
+For example:
+
+```bash
+./evaluate_summaries.py \
+  "The Butchers Masquerade Dungeon Crawler Carl (Book 5) (Matt Dinniman) (Z-Library).epub" \
+  notebooklm-result-butchers_masquerade.txt \
+  results \
+  --evaluator claude-code \
+  --evaluator-model haiku \
+  --resume results/evaluation/run-20260930-185544
+```
+
+This explicit-path behavior is intentional. If several incomplete evaluations exist, the script must not guess which one should be continued.
+
+Completed reference-fact extraction and completed chapter evaluations are reused when resuming. Only missing/incomplete work is processed.
+
+This also makes the workflow robust to Claude Code session limits. If Claude Code returns a `429` such as:
+
+```text
+You've hit your session limit
+```
+
+wait until the session limit resets and rerun the command with the same `--resume` path. Already completed work should remain cached.
 
 ## Evaluation output
 
