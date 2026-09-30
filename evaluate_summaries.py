@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Evaluate EPUB summaries against a NotebookLM reference using a local LLM in LM Studio.
+Evaluate EPUB summaries against a NotebookLM reference using a configurable local or cloud LLM evaluator.
 
 Usage:
     python3 evaluate_summaries.py BOOK.epub NOTEBOOKLM_SUMMARY.md RESULTS_DIR
@@ -15,7 +15,7 @@ The evaluator:
 - records evaluator model/configuration and source-model runtime metadata;
 - produces JSON + Markdown + HTML reports.
 
-No book text is sent anywhere except the LM Studio server configured with --base-url.
+Book text is sent only to the evaluator provider selected on the command line.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import os
 import re
 import sys
 import time
@@ -192,21 +193,20 @@ def read_epub(epub_path: Path) -> tuple[str, str, list[Chapter]]:
 # LM Studio
 # ---------------------------------------------------------------------------
 
-def api_request(url: str, payload: dict, timeout: int = 900) -> dict:
+def api_request(url: str, payload: dict, headers: Optional[dict] = None, timeout: int = 900) -> dict:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
-    )
+    req_headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if headers:
+        req_headers.update(headers)
+    req = urllib.request.Request(url, data=data, headers=req_headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"LM Studio HTTP {e.code}: {body}") from e
+        raise RuntimeError(f"HTTP {e.code} from {url}: {body}") from e
     except urllib.error.URLError as e:
-        raise RuntimeError(f"Could not connect to LM Studio at {url}.") from e
+        raise RuntimeError(f"Could not connect to {url}.") from e
 
 
 def get_loaded_model(base_url: str) -> tuple[str, dict, int]:
@@ -245,7 +245,112 @@ def reasoning_value(value: str) -> str:
     return {"off": "none", "on": "high"}.get(value, value)
 
 
+def parse_external_usage(usage: dict) -> dict:
+    usage = usage or {}
+    # Normalize common provider field names to the fields used by the report.
+    prompt = usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0
+    completion = usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
+    return {"prompt_tokens": int(prompt), "completion_tokens": int(completion), **usage}
+
+
+def cloud_chat_openai(
+    model: str,
+    system: str,
+    user: str,
+    max_tokens: int,
+    temperature: float,
+    reasoning: str,
+    timeout: int,
+) -> tuple[str, dict, float, dict]:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set.")
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "reasoning_effort": reasoning_value(reasoning),
+    }
+    started = time.perf_counter()
+    response = api_request(
+        "https://api.openai.com/v1/chat/completions",
+        payload,
+        {"Authorization": f"Bearer {api_key}"},
+        timeout,
+    )
+    elapsed = time.perf_counter() - started
+    try:
+        choice = response["choices"][0]
+        message = choice["message"]
+        content = (message.get("content") or "").strip()
+        finish_reason = choice.get("finish_reason")
+    except (KeyError, IndexError, TypeError) as e:
+        raise RuntimeError(f"Unexpected OpenAI response: {response}") from e
+    usage = parse_external_usage(response.get("usage"))
+    if not content:
+        raise RuntimeError(
+            f"OpenAI evaluator returned empty content; finish_reason={finish_reason}, "
+            f"completion_tokens={usage.get('completion_tokens', 0)}"
+        )
+    info = {"display_name": model, "model": model, "provider": "openai", "context": None}
+    return content, usage, elapsed, info
+
+
+def cloud_chat_anthropic(
+    model: str,
+    system: str,
+    user: str,
+    max_tokens: int,
+    temperature: float,
+    reasoning: str,
+    timeout: int,
+) -> tuple[str, dict, float, dict]:
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY is not set.")
+    if reasoning not in ("off",):
+        raise RuntimeError("Anthropic evaluator currently supports --reasoning off only in this script.")
+    # Claude's current API does not require a temperature parameter for the
+    # benchmark; omitting it also avoids incompatibilities with newer models.
+    payload = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": [{"role": "user", "content": user}],
+    }
+    started = time.perf_counter()
+    response = api_request(
+        "https://api.anthropic.com/v1/messages",
+        payload,
+        {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+        timeout,
+    )
+    elapsed = time.perf_counter() - started
+    try:
+        blocks = response.get("content") or []
+        content = "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+        stop_reason = response.get("stop_reason")
+    except (AttributeError, TypeError) as e:
+        raise RuntimeError(f"Unexpected Anthropic response: {response}") from e
+    usage = parse_external_usage(response.get("usage"))
+    if not content:
+        raise RuntimeError(
+            f"Anthropic evaluator returned empty content; stop_reason={stop_reason}, "
+            f"output_tokens={usage.get('completion_tokens', 0)}"
+        )
+    info = {"display_name": model, "model": model, "provider": "anthropic", "context": None}
+    return content, usage, elapsed, info
+
+
 def chat(
+    provider: str,
     base_url: str,
     model: str,
     system: str,
@@ -254,37 +359,42 @@ def chat(
     temperature: float,
     reasoning: str,
     timeout: int,
-) -> tuple[str, dict, float]:
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "reasoning_effort": reasoning_value(reasoning),
-    }
-    started = time.perf_counter()
-    response = api_request(base_url.rstrip("/") + "/v1/chat/completions", payload, timeout)
-    elapsed = time.perf_counter() - started
-    try:
-        choice = response["choices"][0]
-        message = choice["message"]
-        content = (message.get("content") or "").strip()
-        finish_reason = choice.get("finish_reason")
-    except (KeyError, IndexError, TypeError) as e:
-        raise RuntimeError(f"Unexpected LM Studio response: {response}") from e
-    usage = response.get("usage") or {}
-    if not content:
-        details = usage.get("completion_tokens_details") or {}
-        raise RuntimeError(
-            f"Evaluator returned empty content; finish_reason={finish_reason}, "
-            f"completion_tokens={usage.get('completion_tokens', 0)}, "
-            f"reasoning_tokens={details.get('reasoning_tokens', 0)}"
-        )
-    return content, usage, elapsed
-
+) -> tuple[str, dict, float, dict]:
+    if provider == "local":
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "reasoning_effort": reasoning_value(reasoning),
+        }
+        started = time.perf_counter()
+        response = api_request(base_url.rstrip("/") + "/v1/chat/completions", payload, timeout=timeout)
+        elapsed = time.perf_counter() - started
+        try:
+            choice = response["choices"][0]
+            message = choice["message"]
+            content = (message.get("content") or "").strip()
+            finish_reason = choice.get("finish_reason")
+        except (KeyError, IndexError, TypeError) as e:
+            raise RuntimeError(f"Unexpected LM Studio response: {response}") from e
+        usage = parse_external_usage(response.get("usage"))
+        if not content:
+            details = usage.get("completion_tokens_details") or {}
+            raise RuntimeError(
+                f"Evaluator returned empty content; finish_reason={finish_reason}, "
+                f"completion_tokens={usage.get('completion_tokens', 0)}, "
+                f"reasoning_tokens={details.get('reasoning_tokens', 0)}"
+            )
+        return content, usage, elapsed, {"provider": "local"}
+    if provider == "openai":
+        return cloud_chat_openai(model, system, user, max_tokens, temperature, reasoning, timeout)
+    if provider == "anthropic":
+        return cloud_chat_anthropic(model, system, user, max_tokens, temperature, reasoning, timeout)
+    raise RuntimeError(f"Unsupported evaluator provider: {provider}")
 
 def extract_json(text: str) -> Any:
     """Parse JSON from a response, tolerating markdown fences or surrounding prose."""
@@ -740,7 +850,20 @@ def run(args):
     if not runs:
         raise RuntimeError(f"No benchmark runs found below {results_dir}")
 
-    evaluator_model, evaluator_info, evaluator_context = get_loaded_model(args.base_url)
+    if args.evaluator == "local":
+        evaluator_model, evaluator_info, evaluator_context = get_loaded_model(args.base_url)
+    else:
+        if not args.evaluator_model:
+            raise RuntimeError(f"--evaluator-model is required when --evaluator={args.evaluator}")
+        evaluator_model = args.evaluator_model
+        evaluator_info = {
+            "display_name": evaluator_model,
+            "selected_variant": None,
+            "quantization": None,
+            "provider": args.evaluator,
+        }
+        evaluator_context = 0
+
     eval_root = results_dir / "evaluation" / datetime.now().astimezone().strftime("run-%Y%m%d-%H%M%S")
     eval_root.mkdir(parents=True, exist_ok=False)
 
@@ -752,13 +875,15 @@ def run(args):
     print(f"Chapters:   {len(chapters)}")
     print(f"Reference:  {reference_path}")
     print(f"Runs:       {len(runs)}")
-    print(f"Evaluator:  {evaluator_info.get('display_name', evaluator_model)}")
-    print(f"Eval model: {evaluator_model}")
-    print(f"Context:    {evaluator_context:,} tokens")
+    print(f"Evaluator:  {args.evaluator}")
+    print(f"Eval model: {evaluator_info.get('display_name', evaluator_model)}")
+    if evaluator_context:
+        print(f"Context:    {evaluator_context:,} tokens")
     print(f"Output:     {eval_root}")
     print()
 
     save_json(eval_root / "evaluator_info.json", {
+        "provider": args.evaluator,
         "model": evaluator_model,
         "source_language": book_language,
         "display_name": evaluator_info.get("display_name", evaluator_model),
@@ -792,7 +917,7 @@ def run(args):
             source=chapter.text,
         )
         budget = min(args.max_tokens_facts, max(args.min_output_tokens, dynamic_budget(prompt, args.max_tokens_facts, args.min_output_tokens)))
-        raw, usage, elapsed = chat(args.base_url, evaluator_model, SYSTEM, prompt, budget, args.temperature, args.reasoning, args.timeout)
+        raw, usage, elapsed = chat(args.evaluator, args.base_url, evaluator_model, SYSTEM, prompt, budget, args.temperature, args.reasoning, args.timeout)
         parsed = extract_json(raw)
         facts = parsed.get("facts", []) if isinstance(parsed, dict) else []
         # Ensure stable IDs even if evaluator omitted/duplicated IDs.
@@ -867,7 +992,7 @@ def run(args):
                 source=chapter.text,
             )
             budget = min(args.max_tokens_eval, max(args.min_output_tokens, dynamic_budget(prompt, args.max_tokens_eval, args.min_output_tokens)))
-            raw, usage, elapsed = chat(args.base_url, evaluator_model, SYSTEM, prompt, budget, args.temperature, args.reasoning, args.timeout)
+            raw, usage, elapsed = chat(args.evaluator, args.base_url, evaluator_model, SYSTEM, prompt, budget, args.temperature, args.reasoning, args.timeout)
             parsed = extract_json(raw)
             result = {
                 "chapter": chapter.number,
@@ -920,7 +1045,7 @@ def run(args):
             summary=summary,
         )
         budget = min(args.max_tokens_book_eval, max(args.min_output_tokens, dynamic_budget(prompt, args.max_tokens_book_eval, args.min_output_tokens)))
-        raw, usage, elapsed = chat(args.base_url, evaluator_model, SYSTEM, prompt, budget, args.temperature, args.reasoning, args.timeout)
+        raw, usage, elapsed = chat(args.evaluator, args.base_url, evaluator_model, SYSTEM, prompt, budget, args.temperature, args.reasoning, args.timeout)
         parsed = extract_json(raw)
         result = {
             "model": item["model"],
@@ -943,6 +1068,7 @@ def run(args):
         "reference": str(reference_path),
         "results_dir": str(results_dir),
         "evaluator": {
+            "provider": args.evaluator,
             "model": evaluator_model,
             "display_name": evaluator_info.get("display_name", evaluator_model),
             "selected_variant": evaluator_info.get("selected_variant"),
@@ -973,12 +1099,14 @@ def save_json(path: Path, obj: Any) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate local EPUB summaries against a NotebookLM reference using a local LM Studio evaluator."
+        description="Evaluate EPUB summaries against a NotebookLM reference using a local or cloud LLM evaluator."
     )
     parser.add_argument("epub", help="Original EPUB file")
     parser.add_argument("reference", help="NotebookLM-generated reference summary file")
     parser.add_argument("results", help="Results directory produced by epub_llm_benchmark.py")
-    parser.add_argument("--base-url", default="http://localhost:1234", help="LM Studio base URL")
+    parser.add_argument("--evaluator", choices=["local", "openai", "anthropic"], default="local", help="Evaluator backend (default: local)")
+    parser.add_argument("--evaluator-model", help="Cloud evaluator model ID; required for openai/anthropic")
+    parser.add_argument("--base-url", default="http://localhost:1234", help="LM Studio base URL for --evaluator local")
     parser.add_argument("--temperature", type=float, default=0.0, help="Evaluator temperature (default: 0.0)")
     parser.add_argument("--reasoning", choices=["off", "low", "medium", "high", "xhigh", "on"], default="off")
     parser.add_argument("--max-tokens-facts", type=int, default=4096, help="Max tokens per chapter reference-fact extraction")
