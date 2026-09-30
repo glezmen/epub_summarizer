@@ -116,6 +116,56 @@ class Chapter:
     text: str
 
 
+def detect_chapter_marker(headings: list[str], text: str) -> tuple[Optional[str], Optional[str]]:
+    """Detect chapter number/title across common EPUB layouts.
+
+    Supported examples:
+      - <h1>1</h1>
+      - <h1>EPILOGUE</h1>
+      - plain text: "1. YIS VENTER RAJONGÁSA"
+      - plain text: "Chapter 1" / "Chapter 1: Title"
+
+    Some EPUBs store the chapter heading in a <p> rather than a heading tag,
+    so the extracted body text is also scanned line-by-line.
+    """
+    candidates = list(headings)
+
+    # Prefer explicit HTML headings when available.
+    for candidate in candidates:
+        value = clean_text(candidate)
+        if not value:
+            continue
+        m = re.fullmatch(r"(?:chapter\s+)?(\d+)(?:\s*[:.-]\s*(.*))?", value, re.IGNORECASE)
+        if m:
+            number = m.group(1)
+            title_suffix = clean_text(m.group(2) or "")
+            title = f"Chapter {number}" if not title_suffix else title_suffix
+            return number, title
+        if value.upper() in {"EPILOGUE", "EPILÓGUS"}:
+            return "EPILOGUE", "Epilogue"
+
+    # Fallback for EPUBs where the chapter heading is a normal paragraph.
+    # Scan only the beginning of the document to avoid mistaking numbered
+    # lists/references later in the chapter for the chapter title.
+    lines = [clean_text(line) for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    for line in lines[:80]:
+        m = re.fullmatch(r"(\d+)\.\s+(.+)", line)
+        if m:
+            return m.group(1), clean_text(m.group(2))
+
+        m = re.fullmatch(r"Chapter\s+(\d+)(?:\s*[:.-]\s*(.*))?", line, re.IGNORECASE)
+        if m:
+            number = m.group(1)
+            suffix = clean_text(m.group(2) or "")
+            return number, (f"Chapter {number}" if not suffix else suffix)
+
+        if line.upper() in {"EPILOGUE", "EPILÓGUS"}:
+            return "EPILOGUE", "Epilogue"
+
+    return None, None
+
+
 def read_epub(epub_path: Path) -> tuple[str, list[Chapter]]:
     with zipfile.ZipFile(epub_path, "r") as z:
         opf_path = find_opf_path(z)
@@ -159,20 +209,9 @@ def read_epub(epub_path: Path) -> tuple[str, list[Chapter]]:
             text = clean_text("".join(parser.parts))
             headings = parser.headings
 
-            # This EPUB stores chapters as h1 containing just "1", "2", ...
-            # and the epilogue as "EPILOGUE".
-            heading = headings[0] if headings else ""
-
-            m = re.fullmatch(r"(\d+)", heading.strip())
-            if m:
-                number = m.group(1)
-                chapters.append(
-                    Chapter(number, f"Chapter {number}", full_path, text)
-                )
-            elif heading.strip().upper() == "EPILOGUE":
-                chapters.append(
-                    Chapter("EPILOGUE", "Epilogue", full_path, text)
-                )
+            number, title = detect_chapter_marker(headings, text)
+            if number and title:
+                chapters.append(Chapter(number, title, full_path, text))
 
         if not chapters:
             raise RuntimeError(

@@ -149,13 +149,37 @@ def read_epub(epub_path: Path) -> tuple[str, list[Chapter]]:
             parser = TextExtractor()
             parser.feed(raw)
             text = clean_text("".join(parser.parts))
+
+            # EPUBs use different ways of marking chapter titles. Some use
+            # h1/h2 elements, while others (e.g. Atlantis-generated EPUBs)
+            # store the title in <title> and/or a paragraph such as
+            # "1. YIS VENTER RAJONGÁSA". Support both forms.
             heading = parser.headings[0] if parser.headings else ""
-            match = re.fullmatch(r"(\d+)", heading.strip())
-            if match:
-                number = match.group(1)
-                chapters.append(Chapter(number, f"Chapter {number}", full_path, text))
-            elif heading.strip().upper() == "EPILOGUE":
-                chapters.append(Chapter("EPILOGUE", "Epilogue", full_path, text))
+            title_match = re.search(r"<title[^>]*>(.*?)</title>", raw, re.I | re.S)
+            document_title = clean_text(html.unescape(title_match.group(1))) if title_match else ""
+
+            candidates = [heading, document_title]
+            number = None
+            chapter_title = ""
+            for candidate in candidates:
+                candidate = clean_text(candidate)
+                m = re.match(r"^(\d+)\.\s*(.+)$", candidate)
+                if m:
+                    number = m.group(1)
+                    chapter_title = m.group(2).strip()
+                    break
+                m = re.fullmatch(r"(\d+)", candidate)
+                if m:
+                    number = m.group(1)
+                    chapter_title = f"Chapter {number}"
+                    break
+                if candidate.upper().startswith("EPILOGUE"):
+                    number = "EPILOGUE"
+                    chapter_title = candidate
+                    break
+
+            if number is not None:
+                chapters.append(Chapter(number, chapter_title, full_path, text))
 
         if not chapters:
             raise RuntimeError("No numbered chapters or EPILOGUE detected in EPUB.")
@@ -298,7 +322,7 @@ def dynamic_budget(text: str, cap: int, minimum: int) -> int:
 # ---------------------------------------------------------------------------
 
 CHAPTER_HEADING_RE = re.compile(
-    r"^\s{0,3}(?:#{1,6}\s*)?chapter\s+(\d+)\b.*$",
+    r"^\s{0,3}(?:#{1,6}\s*)?(?:chapter\s+(\d+)\b.*|(\d+)\.\s+.+)$",
     re.I | re.M,
 )
 EPILOGUE_HEADING_RE = re.compile(r"^\s{0,3}(?:#{1,6}\s*)?epilogue\b.*$", re.I | re.M)
@@ -308,7 +332,9 @@ def parse_reference_sections(text: str) -> dict[str, str]:
     """Parse Markdown-like NotebookLM chapter headings into sections."""
     matches = []
     for m in CHAPTER_HEADING_RE.finditer(text):
-        matches.append((m.start(), m.end(), m.group(1)))
+        key = m.group(1) or m.group(2)
+        if key:
+            matches.append((m.start(), m.end(), key))
     for m in EPILOGUE_HEADING_RE.finditer(text):
         matches.append((m.start(), m.end(), "EPILOGUE"))
     matches.sort()
