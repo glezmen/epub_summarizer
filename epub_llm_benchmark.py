@@ -386,7 +386,7 @@ def api_request(url: str, payload: dict, timeout: int = 600) -> dict:
         ) from e
 
 
-def get_loaded_model(base_url: str) -> tuple[str, dict, int]:
+def get_loaded_model(base_url: str) -> tuple[str, dict, int, list[str]]:
     """Find the actually loaded LLM via LM Studio's native API."""
     url = base_url.rstrip("/") + "/api/v1/models"
     try:
@@ -420,7 +420,41 @@ def get_loaded_model(base_url: str) -> tuple[str, dict, int]:
     if not isinstance(context_length, int) or context_length <= 0:
         raise RuntimeError(f"No valid context_length found for loaded model {info.get('key')}")
 
-    return info["key"], info, context_length
+    # Native LM Studio model metadata exposes which reasoning settings are
+    # actually supported by the loaded model. Different model families can
+    # have different restrictions (e.g. DeepSeek R1 may support only "on").
+    reasoning_caps = info.get("capabilities", {}).get("reasoning", {})
+    allowed_reasoning = reasoning_caps.get("allowed_options") or []
+    if not isinstance(allowed_reasoning, list):
+        allowed_reasoning = []
+    allowed_reasoning = [str(x) for x in allowed_reasoning]
+
+    return info["key"], info, context_length, allowed_reasoning
+
+
+def resolve_reasoning(requested: str, allowed: list[str], model_info: dict) -> str:
+    """Resolve the requested reasoning mode against LM Studio capabilities.
+
+    The benchmark should not fail merely because a model requires reasoning.
+    If the requested mode is unsupported, prefer the model's declared default;
+    otherwise fall back to the first supported option. If metadata is missing,
+    keep the requested value and let LM Studio validate it.
+    """
+    if not allowed:
+        return requested
+    if requested in allowed:
+        return requested
+
+    default = (
+        model_info.get("capabilities", {})
+        .get("reasoning", {})
+        .get("default")
+    )
+    if default in allowed:
+        return default
+    if requested == "off" and "on" in allowed:
+        return "on"
+    return allowed[0]
 
 
 def chat(
@@ -432,57 +466,70 @@ def chat(
     timeout: int,
     reasoning: str,
 ) -> tuple[str, dict, float]:
-    url = base_url.rstrip("/") + "/v1/chat/completions"
+    """Call LM Studio's native v1 chat API.
+
+    The native API is preferred over /v1/chat/completions because it exposes
+    reasoning as a first-class request option and returns authoritative
+    inference statistics (including reasoning tokens and generation speed).
+    """
+    url = base_url.rstrip("/") + "/api/v1/chat"
 
     payload = {
         "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a precise literary text summarizer. "
-                    "You must only use information present in the supplied text. "
-                    "Do not invent events, characters, motivations, or facts."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
+        "input": prompt,
+        "system_prompt": (
+            "You are a precise literary text summarizer. "
+            "You must only use information present in the supplied text. "
+            "Do not invent events, characters, motivations, or facts."
+        ),
         "temperature": temperature,
-        "max_tokens": max_tokens,
+        "max_output_tokens": max_tokens,
+        "reasoning": reasoning,
+        "stream": False,
     }
-
-    # LM Studio expects "none" to disable reasoning. Keep the CLI
-    # spelling "off" for readability, but translate it for the API.
-    reasoning_effort = {
-        "off": "none",
-        "on": "high",
-    }.get(reasoning, reasoning)
-    payload["reasoning_effort"] = reasoning_effort
 
     started = time.perf_counter()
     response = api_request(url, payload, timeout)
     elapsed = time.perf_counter() - started
 
     try:
-        choice = response["choices"][0]
-        message = choice["message"]
-        content = (message.get("content") or "").strip()
-        finish_reason = choice.get("finish_reason")
-    except (KeyError, IndexError, TypeError) as e:
+        output = response.get("output") or []
+        message_parts = [
+            item.get("content", "")
+            for item in output
+            if isinstance(item, dict) and item.get("type") == "message"
+        ]
+        content = "\n".join(part for part in message_parts if part).strip()
+        stats = response.get("stats") or {}
+    except (AttributeError, TypeError) as e:
         raise RuntimeError(f"Unexpected LM Studio response: {response}") from e
 
-    usage = response.get("usage") or {}
+    # Keep the existing benchmark's usage shape, while also preserving the
+    # native LM Studio statistics verbatim for later analysis.
+    input_tokens = int(stats.get("input_tokens", 0) or 0)
+    completion_tokens = int(stats.get("total_output_tokens", 0) or 0)
+    reasoning_tokens = int(stats.get("reasoning_output_tokens", 0) or 0)
+    usage = {
+        "prompt_tokens": input_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": input_tokens + completion_tokens,
+        "completion_tokens_details": {
+            "reasoning_tokens": reasoning_tokens,
+        },
+        "reasoning_tokens": reasoning_tokens,
+        "lmstudio_stats": stats,
+    }
+
     if not content:
-        details = usage.get("completion_tokens_details", {}) or {}
-        reasoning_tokens = details.get("reasoning_tokens", 0)
         raise RuntimeError(
             "LM Studio returned an empty final answer. "
-            f"finish_reason={finish_reason}, "
-            f"prompt_tokens={usage.get('prompt_tokens', 0)}, "
-            f"completion_tokens={usage.get('completion_tokens', 0)}, "
-            f"reasoning_tokens={reasoning_tokens}. "
+            f"input_tokens={input_tokens}, "
+            f"total_output_tokens={completion_tokens}, "
+            f"reasoning_output_tokens={reasoning_tokens}, "
+            f"stats={stats}. "
             "The output budget may have been exhausted by reasoning."
         )
+
     return content, usage, elapsed
 
 
@@ -656,7 +703,8 @@ def run(args):
     book_title, book_language, chapters = read_epub(epub_path)
     summary_language = resolve_summary_language(args.summary_language, book_language)
 
-    model, model_info, detected_context = get_loaded_model(args.base_url)
+    model, model_info, detected_context, allowed_reasoning = get_loaded_model(args.base_url)
+    effective_reasoning = resolve_reasoning(args.reasoning, allowed_reasoning, model_info)
     output_dir, model_dir_name, run_id = create_run_output_dir(
         base_output_dir, model
     )
@@ -676,7 +724,8 @@ def run(args):
     print(f"Quant:      {(model_info.get('quantization') or {}).get('name', '?')}")
     print(f"API:        {args.base_url}")
     print(f"Temperature:{args.temperature}")
-    print(f"Reasoning:  {args.reasoning}")
+    print(f"Reasoning:  {effective_reasoning} (requested: {args.reasoning})")
+    print(f"Reasoning supported: {", ".join(allowed_reasoning) if allowed_reasoning else "metadata unavailable"}")
     print(f"Context:    {effective_context:,} tokens")
     print("Chunking:   whole chapter when it fits")
     print(f"Output:     {output_dir}")
@@ -696,9 +745,13 @@ def run(args):
             "model_info": model_info,
             "base_url": args.base_url,
             "temperature": args.temperature,
-            "reasoning": args.reasoning,
+            "reasoning_requested": args.reasoning,
+            "reasoning_effective": effective_reasoning,
+            "reasoning_supported": allowed_reasoning,
             "min_output_tokens": args.min_output_tokens,
             "output_ratio": args.output_ratio,
+            "reasoning_output_ratio": args.reasoning_output_ratio,
+            "reasoning_min_output_tokens": args.reasoning_min_output_tokens,
             "max_tokens_chunk": args.max_tokens_chunk,
             "max_tokens_merge": args.max_tokens_merge,
             "max_tokens_book": args.max_tokens_book,
@@ -722,6 +775,7 @@ def run(args):
     total_elapsed = 0.0
     total_prompt_tokens = 0
     total_completion_tokens = 0
+    total_reasoning_tokens = 0
     completed_chapters_elapsed = 0.0
 
     for chapter_pos, chapter in enumerate(chapters, 1):
@@ -732,8 +786,8 @@ def run(args):
         chapter_output_budget = choose_output_tokens(
             chapter.text,
             cap=args.max_tokens_chunk,
-            minimum=args.min_output_tokens,
-            ratio=args.output_ratio,
+            minimum=(args.reasoning_min_output_tokens if effective_reasoning != "off" else args.min_output_tokens),
+            ratio=(args.reasoning_output_ratio if effective_reasoning != "off" else args.output_ratio),
         )
         chunks = chapter_chunks(
             chapter.text,
@@ -783,12 +837,13 @@ def run(args):
                 chapter_output_budget,
                 args.temperature,
                 args.timeout,
-                args.reasoning,
+                effective_reasoning,
             )
 
             total_elapsed += elapsed
             total_prompt_tokens += int(usage.get("prompt_tokens", 0) or 0)
             total_completion_tokens += int(usage.get("completion_tokens", 0) or 0)
+            total_reasoning_tokens += int(usage.get("reasoning_tokens", 0) or 0)
 
             chunk_record = {
                 "chapter": chapter.number,
@@ -821,8 +876,8 @@ def run(args):
             merge_output_budget = choose_output_tokens(
                 merge_prompt,
                 cap=args.max_tokens_merge,
-                minimum=args.min_output_tokens,
-                ratio=args.output_ratio,
+                minimum=(args.reasoning_min_output_tokens if effective_reasoning != "off" else args.min_output_tokens),
+                ratio=(args.reasoning_output_ratio if effective_reasoning != "off" else args.output_ratio),
             )
             chapter_summary, merge_usage, merge_elapsed = chat(
                 args.base_url,
@@ -831,7 +886,7 @@ def run(args):
                 merge_output_budget,
                 args.temperature,
                 args.timeout,
-                args.reasoning,
+                effective_reasoning,
             )
 
             total_elapsed += merge_elapsed
@@ -841,6 +896,7 @@ def run(args):
             total_completion_tokens += int(
                 merge_usage.get("completion_tokens", 0) or 0
             )
+            total_reasoning_tokens += int(merge_usage.get("reasoning_tokens", 0) or 0)
 
         chapter_record = {
             "chapter": chapter.number,
@@ -871,8 +927,8 @@ def run(args):
     book_output_budget = choose_output_tokens(
         book_prompt,
         cap=args.max_tokens_book,
-        minimum=args.min_output_tokens,
-        ratio=args.output_ratio,
+        minimum=(args.reasoning_min_output_tokens if effective_reasoning != "off" else args.min_output_tokens),
+        ratio=(args.reasoning_output_ratio if effective_reasoning != "off" else args.output_ratio),
     )
     print(
         f"Book summary input: ~{estimate_tokens(book_prompt):,} tokens, "
@@ -886,7 +942,7 @@ def run(args):
         book_output_budget,
         args.temperature,
         args.timeout,
-        args.reasoning,
+        effective_reasoning,
     )
 
     total_elapsed += final_elapsed
@@ -894,6 +950,7 @@ def run(args):
     total_completion_tokens += int(
         final_usage.get("completion_tokens", 0) or 0
     )
+    total_reasoning_tokens += int(final_usage.get("reasoning_tokens", 0) or 0)
 
     (output_dir / "book_summary.md").write_text(
         f"# {book_title}\n\n"
@@ -927,6 +984,7 @@ def run(args):
             "total_elapsed_seconds": total_elapsed,
             "total_prompt_tokens": total_prompt_tokens,
             "total_completion_tokens": total_completion_tokens,
+            "total_reasoning_tokens": total_reasoning_tokens,
         },
     )
 
@@ -935,6 +993,7 @@ def run(args):
     if total_prompt_tokens or total_completion_tokens:
         print(f"Prompt tokens:     {total_prompt_tokens:,}")
         print(f"Completion tokens: {total_completion_tokens:,}")
+        print(f"Reasoning tokens:   {total_reasoning_tokens:,}")
     print(f"Results: {output_dir}")
 
 
@@ -968,14 +1027,14 @@ def main():
     parser.add_argument(
         "--max-tokens-chunk",
         type=int,
-        default=4096,
-        help="Maximum generated tokens per chunk summary (dynamic budget is chosen up to this cap)",
+        default=8192,
+        help="Maximum generated tokens per chunk summary (default: 8192; reasoning models need extra room)",
     )
     parser.add_argument(
         "--max-tokens-merge",
         type=int,
-        default=4096,
-        help="Maximum generated tokens for a multi-chunk chapter merge (dynamic budget is chosen up to this cap)",
+        default=8192,
+        help="Maximum generated tokens for a multi-chunk chapter merge (default: 8192)",
     )
     parser.add_argument(
         "--max-tokens-book",
@@ -996,6 +1055,18 @@ def main():
         help="Dynamic output budget as a fraction of estimated input tokens (default: 0.5)",
     )
     parser.add_argument(
+        "--reasoning-output-ratio",
+        type=float,
+        default=1.0,
+        help="Dynamic output budget ratio for reasoning models (default: 1.0)",
+    )
+    parser.add_argument(
+        "--reasoning-min-output-tokens",
+        type=int,
+        default=4096,
+        help="Minimum output budget for reasoning models (default: 4096)",
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         default=0.0,
@@ -1008,9 +1079,9 @@ def main():
     )
     parser.add_argument(
         "--reasoning",
-        choices=["off", "low", "medium", "high", "xhigh", "on"],
+        choices=["off", "low", "medium", "high", "on"],
         default="off",
-        help="LM Studio reasoning mode. 'off' is recommended for summarization benchmark runs.",
+        help="Requested LM Studio reasoning mode. If unsupported by the loaded model, the script automatically uses a supported mode.",
     )
     parser.add_argument(
         "--timeout",
