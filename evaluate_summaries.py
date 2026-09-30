@@ -25,6 +25,8 @@ import html
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -300,6 +302,102 @@ def cloud_chat_openai(
     return content, usage, elapsed, info
 
 
+def cloud_chat_claude_code(
+    model: str,
+    system: str,
+    user: str,
+    max_tokens: int,
+    temperature: float,
+    reasoning: str,
+    timeout: int,
+) -> tuple[str, dict, float, dict]:
+    """Call the locally authenticated Claude Code CLI without an API key.
+
+    Claude Code print mode supports JSON output and can read the prompt from
+    stdin. We deliberately use one non-agentic turn because this evaluator
+    should only judge the supplied text and must not modify/read project files.
+    """
+    claude = shutil.which("claude")
+    if not claude:
+        raise RuntimeError(
+            "Claude Code CLI was not found in PATH. Run 'claude' once and make sure it is installed and authenticated."
+        )
+
+    if reasoning not in ("off",):
+        raise RuntimeError("Claude Code evaluator currently supports --reasoning off only in this script.")
+
+    # max_tokens is communicated in the prompt because Claude Code's print-mode
+    # CLI does not expose the same max_tokens parameter as the Messages API.
+    user_with_budget = (
+        user
+        + "\n\nIMPORTANT OUTPUT LIMIT: Keep your JSON response within approximately "
+        + str(max_tokens)
+        + " output tokens. Return JSON only."
+    )
+
+    cmd = [
+        claude,
+        "-p",
+        "--output-format", "json",
+        "--model", model,
+        "--system-prompt", system,
+        "--max-turns", "1",
+    ]
+
+    started = time.perf_counter()
+    try:
+        completed = subprocess.run(
+            cmd,
+            input=user_with_budget,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"Claude Code evaluator timed out after {timeout} seconds.") from e
+
+    elapsed = time.perf_counter() - started
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip()
+        stdout = completed.stdout.strip()
+        detail = stderr or stdout or f"exit code {completed.returncode}"
+        raise RuntimeError(f"Claude Code evaluator failed: {detail}")
+
+    try:
+        response = json.loads(completed.stdout)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            "Claude Code did not return valid JSON output. "
+            f"Output: {completed.stdout[:1000]}"
+        ) from e
+
+    if response.get("is_error"):
+        raise RuntimeError(f"Claude Code evaluator returned an error: {response}")
+
+    content = str(response.get("result") or "").strip()
+    if not content:
+        raise RuntimeError(f"Claude Code evaluator returned empty content: {response}")
+
+    usage = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "duration_ms": response.get("duration_ms"),
+        "duration_api_ms": response.get("duration_api_ms"),
+        "num_turns": response.get("num_turns"),
+        "total_cost_usd": response.get("total_cost_usd"),
+        "session_id": response.get("session_id"),
+    }
+    info = {
+        "display_name": model,
+        "model": model,
+        "provider": "claude-code",
+        "context": None,
+        "cost_usd": response.get("total_cost_usd"),
+    }
+    return content, usage, elapsed, info
+
+
 def cloud_chat_anthropic(
     model: str,
     system: str,
@@ -394,6 +492,8 @@ def chat(
         return cloud_chat_openai(model, system, user, max_tokens, temperature, reasoning, timeout)
     if provider == "anthropic":
         return cloud_chat_anthropic(model, system, user, max_tokens, temperature, reasoning, timeout)
+    if provider == "claude-code":
+        return cloud_chat_claude_code(model, system, user, max_tokens, temperature, reasoning, timeout)
     raise RuntimeError(f"Unsupported evaluator provider: {provider}")
 
 def extract_json(text: str) -> Any:
@@ -852,6 +952,15 @@ def run(args):
 
     if args.evaluator == "local":
         evaluator_model, evaluator_info, evaluator_context = get_loaded_model(args.base_url)
+    elif args.evaluator == "claude-code":
+        evaluator_model = args.evaluator_model or "opus"
+        evaluator_info = {
+            "display_name": evaluator_model,
+            "selected_variant": None,
+            "quantization": None,
+            "provider": "claude-code",
+        }
+        evaluator_context = 0
     else:
         if not args.evaluator_model:
             raise RuntimeError(f"--evaluator-model is required when --evaluator={args.evaluator}")
@@ -1104,8 +1213,8 @@ def main():
     parser.add_argument("epub", help="Original EPUB file")
     parser.add_argument("reference", help="NotebookLM-generated reference summary file")
     parser.add_argument("results", help="Results directory produced by epub_llm_benchmark.py")
-    parser.add_argument("--evaluator", choices=["local", "openai", "anthropic"], default="local", help="Evaluator backend (default: local)")
-    parser.add_argument("--evaluator-model", help="Cloud evaluator model ID; required for openai/anthropic")
+    parser.add_argument("--evaluator", choices=["local", "claude-code", "openai", "anthropic"], default="local", help="Evaluator backend (default: local)")
+    parser.add_argument("--evaluator-model", help="Evaluator model ID; for claude-code defaults to 'opus'")
     parser.add_argument("--base-url", default="http://localhost:1234", help="LM Studio base URL for --evaluator local")
     parser.add_argument("--temperature", type=float, default=0.0, help="Evaluator temperature (default: 0.0)")
     parser.add_argument("--reasoning", choices=["off", "low", "medium", "high", "xhigh", "on"], default="off")
