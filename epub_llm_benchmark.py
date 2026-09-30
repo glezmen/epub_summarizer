@@ -22,9 +22,10 @@ No book text is sent anywhere except the LM Studio server you configure.
 
 from __future__ import annotations
 
-from datetime import datetime
 import argparse
+from datetime import datetime
 import json
+import html
 import re
 import sys
 import time
@@ -116,6 +117,43 @@ class Chapter:
     text: str
 
 
+def is_toc_document(href: str, headings: list[str], text: str) -> bool:
+    """Return True for common EPUB table-of-contents documents.
+
+    TOC pages can contain numbered chapter-looking lines, so they must be
+    filtered before chapter detection rather than treated as chapters.
+    """
+    path_name = Path(href).name.lower()
+    stem = Path(href).stem.lower()
+    if stem in {"toc", "contents", "content", "tableofcontents", "table-of-contents", "nav"}:
+        return True
+    if any(token in path_name for token in ("toc", "contents", "tableofcontents", "table-of-contents")):
+        return True
+
+    heading_text = " ".join(headings[:5]).lower()
+    first_text = " ".join(clean_text(x) for x in text.splitlines()[:30]).lower()
+    toc_markers = (
+        "table of contents", "contents", "content",
+        "tartalomjegyzék", "tartalom",
+    )
+    if any(marker in heading_text for marker in toc_markers):
+        return True
+    if any(marker in first_text for marker in toc_markers):
+        # Avoid classifying an ordinary chapter merely because the word
+        # "content" occurs later; only inspect the beginning of the document.
+        return True
+
+    # A TOC typically contains many short numbered entries and very little
+    # prose.  This catches TOCs whose file is named generically (e.g. 001.html).
+    lines = [clean_text(x) for x in text.splitlines() if clean_text(x)]
+    numbered = sum(bool(re.fullmatch(r"(?:Chapter\s+)?\d+(?:\.\s*.*)?", x, re.I)) for x in lines[:80])
+    short_lines = sum(len(x) <= 120 for x in lines[:80])
+    if numbered >= 5 and short_lines >= max(5, int(0.7 * min(len(lines), 80))):
+        return True
+
+    return False
+
+
 def detect_chapter_marker(headings: list[str], text: str) -> tuple[Optional[str], Optional[str]]:
     """Detect chapter number/title across common EPUB layouts.
 
@@ -166,7 +204,7 @@ def detect_chapter_marker(headings: list[str], text: str) -> tuple[Optional[str]
     return None, None
 
 
-def read_epub(epub_path: Path) -> tuple[str, list[Chapter]]:
+def read_epub(epub_path: Path) -> tuple[str, str, list[Chapter]]:
     with zipfile.ZipFile(epub_path, "r") as z:
         opf_path = find_opf_path(z)
         opf_data = z.read(opf_path)
@@ -174,22 +212,37 @@ def read_epub(epub_path: Path) -> tuple[str, list[Chapter]]:
 
         manifest = {}
         for item in root.findall(f".//{{{OPF_NS}}}manifest/{{{OPF_NS}}}item"):
-            manifest[item.attrib["id"]] = item.attrib["href"]
+            manifest[item.attrib["id"]] = {
+                "href": item.attrib.get("href", ""),
+                "properties": item.attrib.get("properties", ""),
+                "media_type": item.attrib.get("media-type", ""),
+            }
 
         spine = []
         for itemref in root.findall(f".//{{{OPF_NS}}}spine/{{{OPF_NS}}}itemref"):
             spine.append(itemref.attrib["idref"])
 
         book_title = ""
+        book_language = ""
         title_el = root.find(f".//{{{DC_NS}}}title")
         if title_el is not None and title_el.text:
             book_title = title_el.text.strip()
+        language_el = root.find(f".//{{{DC_NS}}}language")
+        if language_el is not None and language_el.text:
+            book_language = language_el.text.strip()
 
         chapters: list[Chapter] = []
 
         for idref in spine:
-            href = manifest.get(idref)
-            if not href:
+            item = manifest.get(idref)
+            if not item:
+                continue
+            href = item["href"]
+            properties = item["properties"].split()
+
+            # EPUB3 navigation documents are metadata/navigation, not plot
+            # chapters, even when they appear in the spine.
+            if "nav" in properties or "toc" in properties:
                 continue
 
             # Resolve relative to the OPF directory.
@@ -209,6 +262,11 @@ def read_epub(epub_path: Path) -> tuple[str, list[Chapter]]:
             text = clean_text("".join(parser.parts))
             headings = parser.headings
 
+            # Some EPUBs put the table of contents in the spine and use a
+            # generic filename.  Filter it before chapter-number detection.
+            if is_toc_document(full_path, headings, text):
+                continue
+
             number, title = detect_chapter_marker(headings, text)
             if number and title:
                 chapters.append(Chapter(number, title, full_path, text))
@@ -219,7 +277,7 @@ def read_epub(epub_path: Path) -> tuple[str, list[Chapter]]:
                 "Inspect the EPUB structure or add a custom chapter detector."
             )
 
-        return book_title, chapters
+        return book_title, book_language, chapters
 
 
 def find_opf_path(z: zipfile.ZipFile) -> str:
@@ -436,6 +494,8 @@ CHUNK_PROMPT = """We are running a reproducible benchmark of local LLMs on a nov
 
 Book: {book_title}
 Chapter: {chapter_title}
+Summary language: {summary_language}
+Source language: {book_language}
 This is chunk {chunk_index} of {chunk_count}.
 
 Summarize ONLY the plot events contained in this text.
@@ -451,6 +511,7 @@ The summary must:
 - avoid information not present in this chunk.
 
 Do not quote the novel.
+Write the summary in {summary_language}. Do not translate it to another language unless that is the selected summary language.
 
 TEXT:
 {chunk}
@@ -459,6 +520,8 @@ TEXT:
 MERGE_PROMPT = """We are running a reproducible benchmark of local LLMs on a novel.
 
 Book: {book_title}
+Source language: {book_language}
+Summary language: {summary_language}
 Chapter: {chapter_title}
 
 Below are summaries of consecutive chunks from the SAME chapter.
@@ -474,6 +537,7 @@ Requirements:
 - do not add information from outside these summaries;
 - do not discuss the quality of the writing;
 - do not quote the novel.
+Write the summary in {summary_language}. Do not translate it to another language unless that is the selected summary language.
 
 CHUNK SUMMARIES:
 {summaries}
@@ -482,6 +546,8 @@ CHUNK SUMMARIES:
 BOOK_PROMPT = """We are running a reproducible benchmark of local LLMs on a novel.
 
 Book: {book_title}
+Source language: {book_language}
+Summary language: {summary_language}
 
 Below are factual summaries of every chapter, in chronological order.
 
@@ -497,6 +563,7 @@ Requirements:
 - use ONLY the chapter summaries supplied below;
 - do not discuss the quality of the writing;
 - do not quote the novel.
+Write the summary in {summary_language}. Do not translate it to another language unless that is the selected summary language.
 
 CHAPTER SUMMARIES:
 {summaries}
@@ -506,6 +573,46 @@ CHAPTER SUMMARIES:
 # -----------------------------
 # Benchmark runner
 # -----------------------------
+
+LANGUAGE_NAMES = {
+    "en": "English",
+    "hu": "Hungarian",
+    "de": "German",
+    "fr": "French",
+    "es": "Spanish",
+    "it": "Italian",
+    "pt": "Portuguese",
+    "nl": "Dutch",
+    "pl": "Polish",
+    "cs": "Czech",
+    "sk": "Slovak",
+    "ro": "Romanian",
+    "ru": "Russian",
+    "uk": "Ukrainian",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "zh": "Chinese",
+    "tr": "Turkish",
+    "sv": "Swedish",
+    "no": "Norwegian",
+    "da": "Danish",
+    "fi": "Finnish",
+}
+
+def resolve_summary_language(requested: str, source_language: Optional[str]) -> str:
+    value = (requested or "source").strip()
+    if value.lower() == "source":
+        code = (source_language or "").strip().lower()
+        if code:
+            base = code.split("-")[0].split("_")[0]
+            return LANGUAGE_NAMES.get(base, base.upper())
+        return "the same language as the source text"
+    if value.lower() == "english":
+        return "English"
+    code = value.lower().replace("_", "-")
+    base = code.split("-")[0]
+    return LANGUAGE_NAMES.get(base, code)
+
 
 def format_duration(seconds: float) -> str:
     seconds = max(0, int(round(seconds)))
@@ -546,7 +653,8 @@ def run(args):
     base_output_dir = Path(args.output).expanduser().resolve()
     base_output_dir.mkdir(parents=True, exist_ok=True)
 
-    book_title, chapters = read_epub(epub_path)
+    book_title, book_language, chapters = read_epub(epub_path)
+    summary_language = resolve_summary_language(args.summary_language, book_language)
 
     model, model_info, detected_context = get_loaded_model(args.base_url)
     output_dir, model_dir_name, run_id = create_run_output_dir(
@@ -558,6 +666,8 @@ def run(args):
     print("=" * 58)
     print()
     print(f"Book:       {book_title}")
+    print(f"Language:   {book_language or 'metadata unavailable'}")
+    print(f"Summary:    {summary_language}")
     print(f"Chapters:   {len(chapters)} + Epilogue")
     effective_context = args.context if args.context is not None else detected_context
     print(f"Model:      {model_info.get('display_name', model)}")
@@ -577,6 +687,8 @@ def run(args):
         output_dir / "book_info.json",
         {
             "book_title": book_title,
+            "source_language": book_language,
+            "summary_language": summary_language,
             "source_file": epub_path.name,
             "model": model,
             "model_dir": model_dir_name,
@@ -656,6 +768,8 @@ def run(args):
         for i, chunk in enumerate(chunks, 1):
             prompt = CHUNK_PROMPT.format(
                 book_title=book_title,
+                book_language=book_language or "metadata unavailable",
+                summary_language=summary_language,
                 chapter_title=chapter.title,
                 chunk_index=i,
                 chunk_count=len(chunks),
@@ -695,6 +809,8 @@ def run(args):
         else:
             merge_prompt = MERGE_PROMPT.format(
                 book_title=book_title,
+                book_language=book_language or "metadata unavailable",
+                summary_language=summary_language,
                 chapter_title=chapter.title,
                 summaries="\n\n".join(
                     f"--- Chunk {i} ---\n{s}"
@@ -747,6 +863,8 @@ def run(args):
 
     book_prompt = BOOK_PROMPT.format(
         book_title=book_title,
+        book_language=book_language or "metadata unavailable",
+        summary_language=summary_language,
         summaries="\n\n".join(all_chapter_summaries),
     )
 
@@ -882,6 +1000,11 @@ def main():
         type=float,
         default=0.0,
         help="Sampling temperature. 0.0 is recommended for benchmark runs.",
+    )
+    parser.add_argument(
+        "--summary-language",
+        default="source",
+        help="Language of generated summaries: source (default), english, or an explicit ISO language code such as hu, de, fr.",
     )
     parser.add_argument(
         "--reasoning",

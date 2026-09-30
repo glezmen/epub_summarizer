@@ -121,7 +121,7 @@ def find_opf_path(z: zipfile.ZipFile) -> str:
     return rootfile.attrib["full-path"]
 
 
-def read_epub(epub_path: Path) -> tuple[str, list[Chapter]]:
+def read_epub(epub_path: Path) -> tuple[str, str, list[Chapter]]:
     with zipfile.ZipFile(epub_path, "r") as z:
         opf_path = find_opf_path(z)
         root = ET.fromstring(z.read(opf_path))
@@ -134,6 +134,8 @@ def read_epub(epub_path: Path) -> tuple[str, list[Chapter]]:
         ]
         title_el = root.find(f".//{{{DC_NS}}}title")
         book_title = title_el.text.strip() if title_el is not None and title_el.text else epub_path.stem
+        language_el = root.find(f".//{{{DC_NS}}}language")
+        book_language = language_el.text.strip() if language_el is not None and language_el.text else ""
         chapters: list[Chapter] = []
         opf_dir = Path(opf_path).parent
 
@@ -183,7 +185,7 @@ def read_epub(epub_path: Path) -> tuple[str, list[Chapter]]:
 
         if not chapters:
             raise RuntimeError("No numbered chapters or EPILOGUE detected in EPUB.")
-        return book_title, chapters
+        return book_title, book_language, chapters
 
 
 # ---------------------------------------------------------------------------
@@ -425,8 +427,10 @@ Rules:
 - Do not treat character speculation as fact.
 - Do not create facts that are only present in NotebookLM but unsupported by the EPUB.
 - Do not quote the novel.
+- When describing facts or claims, preserve the source terminology and do not translate factual names or terms unnecessarily.
 
 BOOK: {book_title}
+SOURCE LANGUAGE: {book_language}
 CHAPTER: {chapter_title}
 
 NOTEBOOKLM REFERENCE:
@@ -470,6 +474,7 @@ Rules:
 - Pay special attention to causal relationships, character attribution, chronology, and consequences.
 
 BOOK: {book_title}
+SOURCE LANGUAGE: {book_language}
 CHAPTER: {chapter_title}
 
 REFERENCE FACTS:
@@ -722,7 +727,7 @@ def run(args):
     reference_path = Path(args.reference).expanduser().resolve()
     results_dir = Path(args.results).expanduser().resolve()
 
-    book_title, chapters = read_epub(epub_path)
+    book_title, book_language, chapters = read_epub(epub_path)
     reference_text = reference_path.read_text(encoding="utf-8")
     reference_sections = parse_reference_sections(reference_text)
     if not reference_sections:
@@ -743,6 +748,7 @@ def run(args):
     print(" EPUB LLM SUMMARY EVALUATION")
     print("=" * 70)
     print(f"Book:       {book_title}")
+    print(f"Language:   {book_language or 'metadata unavailable'}")
     print(f"Chapters:   {len(chapters)}")
     print(f"Reference:  {reference_path}")
     print(f"Runs:       {len(runs)}")
@@ -754,6 +760,7 @@ def run(args):
 
     save_json(eval_root / "evaluator_info.json", {
         "model": evaluator_model,
+        "source_language": book_language,
         "display_name": evaluator_info.get("display_name", evaluator_model),
         "selected_variant": evaluator_info.get("selected_variant"),
         "quantization": evaluator_info.get("quantization"),
@@ -779,6 +786,7 @@ def run(args):
             continue
         prompt = FACT_PROMPT.format(
             book_title=book_title,
+            book_language=book_language or "same as source text",
             chapter_title=chapter.title,
             reference=reference_section,
             source=chapter.text,
@@ -816,7 +824,7 @@ def run(args):
     for chapter in chapters:
         for fact in all_reference_facts.get(chapter.number, []):
             flat_facts.append({"chapter": chapter.number, **fact})
-    save_json(eval_root / "reference_facts.json", {"book_title": book_title, "facts": flat_facts})
+    save_json(eval_root / "reference_facts.json", {"book_title": book_title, "source_language": book_language, "facts": flat_facts})
 
     # Phase 2: evaluate each run chapter by chapter.
     model_reports = []
