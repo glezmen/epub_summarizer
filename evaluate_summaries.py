@@ -1045,7 +1045,7 @@ def run(args):
             source=chapter.text,
         )
         budget = min(args.max_tokens_facts, max(args.min_output_tokens, dynamic_budget(prompt, args.max_tokens_facts, args.min_output_tokens)))
-        raw, usage, elapsed = chat(args.evaluator, args.base_url, evaluator_model, SYSTEM, prompt, budget, args.temperature, args.reasoning, args.timeout)
+        raw, usage, elapsed, _ = chat(args.evaluator, args.base_url, evaluator_model, SYSTEM, prompt, budget, args.temperature, args.reasoning, args.timeout)
         parsed = extract_json(raw)
         facts = parsed.get("facts", []) if isinstance(parsed, dict) else []
         # Ensure stable IDs even if evaluator omitted/duplicated IDs.
@@ -1122,7 +1122,7 @@ def run(args):
                 source=chapter.text,
             )
             budget = min(args.max_tokens_eval, max(args.min_output_tokens, dynamic_budget(prompt, args.max_tokens_eval, args.min_output_tokens)))
-            raw, usage, elapsed = chat(args.evaluator, args.base_url, evaluator_model, SYSTEM, prompt, budget, args.temperature, args.reasoning, args.timeout)
+            raw, usage, elapsed, _ = chat(args.evaluator, args.base_url, evaluator_model, SYSTEM, prompt, budget, args.temperature, args.reasoning, args.timeout)
             parsed = extract_json(raw)
             result = {
                 "chapter": chapter.number,
@@ -1175,7 +1175,7 @@ def run(args):
             summary=summary,
         )
         budget = min(args.max_tokens_book_eval, max(args.min_output_tokens, dynamic_budget(prompt, args.max_tokens_book_eval, args.min_output_tokens)))
-        raw, usage, elapsed = chat(args.evaluator, args.base_url, evaluator_model, SYSTEM, prompt, budget, args.temperature, args.reasoning, args.timeout)
+        raw, usage, elapsed, _ = chat(args.evaluator, args.base_url, evaluator_model, SYSTEM, prompt, budget, args.temperature, args.reasoning, args.timeout)
         parsed = extract_json(raw)
         result = {
             "model": item["model"],
