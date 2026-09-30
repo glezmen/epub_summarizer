@@ -695,19 +695,145 @@ def create_run_output_dir(base_output: Path, model_key: str) -> tuple[Path, str,
     return run_dir, model_dir_name, timestamp
 
 
+
+def load_json(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def usage_totals(usage: dict) -> tuple[int, int, int]:
+    return (
+        int(usage.get("prompt_tokens", 0) or 0),
+        int(usage.get("completion_tokens", 0) or 0),
+        int(usage.get("reasoning_tokens", 0) or 0),
+    )
+
+
+def cached_chunk_summary(
+    chunk_path: Path,
+    expected_chapter: str,
+    expected_chunk: int,
+    expected_chunk_count: int,
+) -> tuple[Optional[str], dict, float]:
+    """Load a completed chunk artifact if it matches the current deterministic plan."""
+    if not chunk_path.exists():
+        return None, {}, 0.0
+    try:
+        record = load_json(chunk_path)
+        if (
+            str(record.get("chapter")) != str(expected_chapter)
+            or int(record.get("chunk", -1)) != expected_chunk
+            or int(record.get("chunk_count", -1)) != expected_chunk_count
+            or not str(record.get("summary", "")).strip()
+        ):
+            return None, {}, 0.0
+        return (
+            str(record["summary"]).strip(),
+            record.get("usage") or {},
+            float(record.get("elapsed_seconds", 0.0) or 0.0),
+        )
+    except (OSError, ValueError, TypeError, KeyError):
+        return None, {}, 0.0
+
+
+def cached_chapter_summary(
+    chapter_path: Path,
+    expected_chapter: str,
+    expected_title: str,
+    expected_source_characters: int,
+    expected_chunk_count: int,
+) -> tuple[Optional[str], dict, float]:
+    """Load a completed chapter artifact if it matches the current EPUB parse."""
+    if not chapter_path.exists():
+        return None, {}, 0.0
+    try:
+        record = load_json(chapter_path)
+        if (
+            str(record.get("chapter")) != str(expected_chapter)
+            or record.get("title") != expected_title
+            or int(record.get("source_characters", -1)) != expected_source_characters
+            or int(record.get("chunk_count", -1)) != expected_chunk_count
+            or not str(record.get("summary", "")).strip()
+        ):
+            return None, {}, 0.0
+        return (
+            str(record["summary"]).strip(),
+            record.get("merge_usage") or {},
+            float(record.get("merge_elapsed_seconds", 0.0) or 0.0),
+        )
+    except (OSError, ValueError, TypeError, KeyError):
+        return None, {}, 0.0
+
+
+def validate_resume_metadata(
+    output_dir: Path,
+    epub_path: Path,
+    book_title: str,
+    model: str,
+    effective_context: int,
+) -> None:
+    """Reject an obviously incompatible --resume target instead of mixing runs."""
+    info_path = output_dir / "book_info.json"
+    if not info_path.exists():
+        raise RuntimeError(
+            f"Cannot resume '{output_dir}': book_info.json is missing. "
+            "Choose a benchmark run directory created by this script."
+        )
+
+    info = load_json(info_path)
+    checks = [
+        ("source_file", epub_path.name, info.get("source_file")),
+        ("book_title", book_title, info.get("book_title")),
+        ("model", model, info.get("model")),
+    ]
+    for field, expected, actual in checks:
+        if actual and actual != expected:
+            raise RuntimeError(
+                f"Cannot resume '{output_dir}': {field} mismatch "
+                f"(existing={actual!r}, current={expected!r})."
+            )
+
+    existing_context = info.get("context")
+    if existing_context and int(existing_context) != int(effective_context):
+        raise RuntimeError(
+            f"Cannot resume '{output_dir}': context mismatch "
+            f"(existing={existing_context}, current={effective_context}). "
+            "Use the same --context value as the original run."
+        )
+
+
 def run(args):
     epub_path = Path(args.epub).expanduser().resolve()
     base_output_dir = Path(args.output).expanduser().resolve()
-    base_output_dir.mkdir(parents=True, exist_ok=True)
 
     book_title, book_language, chapters = read_epub(epub_path)
     summary_language = resolve_summary_language(args.summary_language, book_language)
 
     model, model_info, detected_context, allowed_reasoning = get_loaded_model(args.base_url)
     effective_reasoning = resolve_reasoning(args.reasoning, allowed_reasoning, model_info)
-    output_dir, model_dir_name, run_id = create_run_output_dir(
-        base_output_dir, model
-    )
+    effective_context = args.context if args.context is not None else detected_context
+
+    if args.resume:
+        output_dir = Path(args.resume).expanduser().resolve()
+        if not output_dir.is_dir():
+            raise RuntimeError(f"Resume directory does not exist: {output_dir}")
+
+        # The run directory itself determines the model/run identity.
+        model_dir_name = output_dir.parent.name
+        run_id = output_dir.name
+        validate_resume_metadata(
+            output_dir,
+            epub_path,
+            book_title,
+            model,
+            effective_context,
+        )
+        print(f"Resuming benchmark: {output_dir}")
+    else:
+        base_output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir, model_dir_name, run_id = create_run_output_dir(
+            base_output_dir, model
+        )
 
     print("=" * 58)
     print(" EPUB LLM BENCHMARK")
@@ -716,7 +842,7 @@ def run(args):
     print(f"Book:       {book_title}")
     print(f"Language:   {book_language or 'metadata unavailable'}")
     print(f"Summary:    {summary_language}")
-    print(f"Chapters:   {len(chapters)} + Epilogue")
+    print(f"Chapters:   {len(chapters)}")
     effective_context = args.context if args.context is not None else detected_context
     print(f"Model:      {model_info.get('display_name', model)}")
     print(f"Model key:  {model}")
@@ -725,51 +851,55 @@ def run(args):
     print(f"API:        {args.base_url}")
     print(f"Temperature:{args.temperature}")
     print(f"Reasoning:  {effective_reasoning} (requested: {args.reasoning})")
-    print(f"Reasoning supported: {", ".join(allowed_reasoning) if allowed_reasoning else "metadata unavailable"}")
+    print(f"Reasoning supported: {', '.join(allowed_reasoning) if allowed_reasoning else 'metadata unavailable'}")
     print(f"Context:    {effective_context:,} tokens")
     print("Chunking:   whole chapter when it fits")
     print(f"Output:     {output_dir}")
     print(f"Run ID:     {run_id}")
     print()
 
-    save_json(
-        output_dir / "book_info.json",
-        {
-            "book_title": book_title,
-            "source_language": book_language,
-            "summary_language": summary_language,
-            "source_file": epub_path.name,
-            "model": model,
-            "model_dir": model_dir_name,
-            "run_id": run_id,
-            "model_info": model_info,
-            "base_url": args.base_url,
-            "temperature": args.temperature,
-            "reasoning_requested": args.reasoning,
-            "reasoning_effective": effective_reasoning,
-            "reasoning_supported": allowed_reasoning,
-            "min_output_tokens": args.min_output_tokens,
-            "output_ratio": args.output_ratio,
-            "reasoning_output_ratio": args.reasoning_output_ratio,
-            "reasoning_min_output_tokens": args.reasoning_min_output_tokens,
-            "max_tokens_chunk": args.max_tokens_chunk,
-            "max_tokens_merge": args.max_tokens_merge,
-            "max_tokens_book": args.max_tokens_book,
-            "context": effective_context,
-            "loaded_instance": (model_info.get("loaded_instances") or [{}])[0],
-            "chunking": "whole chapter when it fits; adaptive fallback otherwise",
-            "chunk_overlap": args.chunk_overlap,
-            "chapters": [
-                {
-                    "number": c.number,
-                    "title": c.title,
-                    "href": c.href,
-                    "characters": len(c.text),
-                }
-                for c in chapters
-            ],
-        },
-    )
+    # On a new run this creates the immutable run metadata. On resume, keep
+    # the original metadata and only add/update the current execution fields.
+    book_info_path = output_dir / "book_info.json"
+    if not book_info_path.exists():
+        save_json(
+            book_info_path,
+            {
+                "book_title": book_title,
+                "source_language": book_language,
+                "summary_language": summary_language,
+                "source_file": epub_path.name,
+                "model": model,
+                "model_dir": model_dir_name,
+                "run_id": run_id,
+                "model_info": model_info,
+                "base_url": args.base_url,
+                "temperature": args.temperature,
+                "reasoning_requested": args.reasoning,
+                "reasoning_effective": effective_reasoning,
+                "reasoning_supported": allowed_reasoning,
+                "min_output_tokens": args.min_output_tokens,
+                "output_ratio": args.output_ratio,
+                "reasoning_output_ratio": args.reasoning_output_ratio,
+                "reasoning_min_output_tokens": args.reasoning_min_output_tokens,
+                "max_tokens_chunk": args.max_tokens_chunk,
+                "max_tokens_merge": args.max_tokens_merge,
+                "max_tokens_book": args.max_tokens_book,
+                "context": effective_context,
+                "loaded_instance": (model_info.get("loaded_instances") or [{}])[0],
+                "chunking": "whole chapter when it fits; adaptive fallback otherwise",
+                "chunk_overlap": args.chunk_overlap,
+                "chapters": [
+                    {
+                        "number": c.number,
+                        "title": c.title,
+                        "href": c.href,
+                        "characters": len(c.text),
+                    }
+                    for c in chapters
+                ],
+            },
+        )
 
     all_chapter_summaries = []
     total_elapsed = 0.0
@@ -779,15 +909,27 @@ def run(args):
     completed_chapters_elapsed = 0.0
 
     for chapter_pos, chapter in enumerate(chapters, 1):
-        chapter_dir = output_dir / f"{int(chapter.number):03d}" if chapter.number.isdigit() else output_dir / "epilogue"
+        chapter_dir = (
+            output_dir / f"{int(chapter.number):03d}"
+            if chapter.number.isdigit()
+            else output_dir / "epilogue"
+        )
         chapter_dir.mkdir(parents=True, exist_ok=True)
 
         context_limit = effective_context
         chapter_output_budget = choose_output_tokens(
             chapter.text,
             cap=args.max_tokens_chunk,
-            minimum=(args.reasoning_min_output_tokens if effective_reasoning != "off" else args.min_output_tokens),
-            ratio=(args.reasoning_output_ratio if effective_reasoning != "off" else args.output_ratio),
+            minimum=(
+                args.reasoning_min_output_tokens
+                if effective_reasoning != "off"
+                else args.min_output_tokens
+            ),
+            ratio=(
+                args.reasoning_output_ratio
+                if effective_reasoning != "off"
+                else args.output_ratio
+            ),
         )
         chunks = chapter_chunks(
             chapter.text,
@@ -797,11 +939,52 @@ def run(args):
             overlap_chars=args.chunk_overlap,
         )
 
+        chapter_summary_path = chapter_dir / "chapter_summary.json"
+        cached_summary, cached_merge_usage, cached_merge_elapsed = cached_chapter_summary(
+            chapter_summary_path,
+            chapter.number,
+            chapter.title,
+            len(chapter.text),
+            len(chunks),
+        )
+
+        if cached_summary is not None:
+            print(
+                f"[{chapter_pos:02d}/{len(chapters)}] "
+                f"{chapter.title}: [CACHED] "
+                f"{len(chunks)} chunk(s)"
+            )
+            all_chapter_summaries.append(
+                f"--- {chapter.title} ---\n{cached_summary}"
+            )
+
+            # Include cached inference statistics in the resumed run totals.
+            total_prompt, total_completion, total_reasoning = usage_totals(
+                cached_merge_usage
+            )
+            total_prompt_tokens += total_prompt
+            total_completion_tokens += total_completion
+            total_reasoning_tokens += total_reasoning
+            total_elapsed += cached_merge_elapsed
+
+            # For a multi-chunk chapter, chunk statistics are stored separately.
+            for i in range(1, len(chunks) + 1):
+                _, chunk_usage, chunk_elapsed = cached_chunk_summary(
+                    chapter_dir / f"chunk_{i:02d}.json",
+                    chapter.number,
+                    i,
+                    len(chunks),
+                )
+                p, c, r = usage_totals(chunk_usage)
+                total_prompt_tokens += p
+                total_completion_tokens += c
+                total_reasoning_tokens += r
+                total_elapsed += chunk_elapsed
+            continue
+
         if completed_chapters_elapsed > 0 and chapter_pos > 1:
             avg_chapter_seconds = completed_chapters_elapsed / (chapter_pos - 1)
             remaining_chapters = len(chapters) - chapter_pos + 1
-            # The final whole-book summary is one additional request. Use the
-            # observed average chapter time as a conservative first estimate.
             eta_seconds = avg_chapter_seconds * (remaining_chapters + 1)
             eta_text = format_duration(eta_seconds)
         else:
@@ -820,40 +1003,57 @@ def run(args):
         chunk_summaries = []
 
         for i, chunk in enumerate(chunks, 1):
-            prompt = CHUNK_PROMPT.format(
-                book_title=book_title,
-                book_language=book_language or "metadata unavailable",
-                summary_language=summary_language,
-                chapter_title=chapter.title,
-                chunk_index=i,
-                chunk_count=len(chunks),
-                chunk=chunk,
+            chunk_path = chapter_dir / f"chunk_{i:02d}.json"
+            cached_chunk, cached_usage, cached_elapsed = cached_chunk_summary(
+                chunk_path,
+                chapter.number,
+                i,
+                len(chunks),
             )
 
-            summary, usage, elapsed = chat(
-                args.base_url,
-                model,
-                prompt,
-                chapter_output_budget,
-                args.temperature,
-                args.timeout,
-                effective_reasoning,
-            )
+            if cached_chunk is not None:
+                print(f"    Chunk {i}/{len(chunks)}: [CACHED]")
+                summary = cached_chunk
+                usage = cached_usage
+                elapsed = cached_elapsed
+            else:
+                prompt = CHUNK_PROMPT.format(
+                    book_title=book_title,
+                    book_language=book_language or "metadata unavailable",
+                    summary_language=summary_language,
+                    chapter_title=chapter.title,
+                    chunk_index=i,
+                    chunk_count=len(chunks),
+                    chunk=chunk,
+                )
+
+                summary, usage, elapsed = chat(
+                    args.base_url,
+                    model,
+                    prompt,
+                    chapter_output_budget,
+                    args.temperature,
+                    args.timeout,
+                    effective_reasoning,
+                )
+
+                save_json(
+                    chunk_path,
+                    {
+                        "chapter": chapter.number,
+                        "chunk": i,
+                        "chunk_count": len(chunks),
+                        "summary": summary,
+                        "elapsed_seconds": elapsed,
+                        "usage": usage,
+                    },
+                )
 
             total_elapsed += elapsed
-            total_prompt_tokens += int(usage.get("prompt_tokens", 0) or 0)
-            total_completion_tokens += int(usage.get("completion_tokens", 0) or 0)
-            total_reasoning_tokens += int(usage.get("reasoning_tokens", 0) or 0)
-
-            chunk_record = {
-                "chapter": chapter.number,
-                "chunk": i,
-                "chunk_count": len(chunks),
-                "summary": summary,
-                "elapsed_seconds": elapsed,
-                "usage": usage,
-            }
-            save_json(chapter_dir / f"chunk_{i:02d}.json", chunk_record)
+            p, c, r = usage_totals(usage)
+            total_prompt_tokens += p
+            total_completion_tokens += c
+            total_reasoning_tokens += r
             chunk_summaries.append(summary)
 
         # If there is only one chunk, its summary is already the chapter summary.
@@ -876,8 +1076,16 @@ def run(args):
             merge_output_budget = choose_output_tokens(
                 merge_prompt,
                 cap=args.max_tokens_merge,
-                minimum=(args.reasoning_min_output_tokens if effective_reasoning != "off" else args.min_output_tokens),
-                ratio=(args.reasoning_output_ratio if effective_reasoning != "off" else args.output_ratio),
+                minimum=(
+                    args.reasoning_min_output_tokens
+                    if effective_reasoning != "off"
+                    else args.min_output_tokens
+                ),
+                ratio=(
+                    args.reasoning_output_ratio
+                    if effective_reasoning != "off"
+                    else args.output_ratio
+                ),
             )
             chapter_summary, merge_usage, merge_elapsed = chat(
                 args.base_url,
@@ -890,13 +1098,10 @@ def run(args):
             )
 
             total_elapsed += merge_elapsed
-            total_prompt_tokens += int(
-                merge_usage.get("prompt_tokens", 0) or 0
-            )
-            total_completion_tokens += int(
-                merge_usage.get("completion_tokens", 0) or 0
-            )
-            total_reasoning_tokens += int(merge_usage.get("reasoning_tokens", 0) or 0)
+            p, c, r = usage_totals(merge_usage)
+            total_prompt_tokens += p
+            total_completion_tokens += c
+            total_reasoning_tokens += r
 
         chapter_record = {
             "chapter": chapter.number,
@@ -907,7 +1112,7 @@ def run(args):
             "merge_elapsed_seconds": merge_elapsed,
             "merge_usage": merge_usage,
         }
-        save_json(chapter_dir / "chapter_summary.json", chapter_record)
+        save_json(chapter_summary_path, chapter_record)
 
         all_chapter_summaries.append(
             f"--- {chapter.title} ---\n{chapter_summary}"
@@ -915,62 +1120,95 @@ def run(args):
         completed_chapters_elapsed += time.perf_counter() - chapter_started
 
     # Final whole-book summary.
-    print("\nGenerating complete-book summary...")
+    book_summary_path = output_dir / "book_summary.json"
+    cached_book_summary = None
 
-    book_prompt = BOOK_PROMPT.format(
-        book_title=book_title,
-        book_language=book_language or "metadata unavailable",
-        summary_language=summary_language,
-        summaries="\n\n".join(all_chapter_summaries),
-    )
+    if book_summary_path.exists() and (output_dir / "book_summary.md").exists():
+        try:
+            record = load_json(book_summary_path)
+            if (
+                record.get("book_title") == book_title
+                and record.get("model") == model
+                and str(record.get("summary", "")).strip()
+            ):
+                cached_book_summary = record
+        except (OSError, ValueError, TypeError):
+            cached_book_summary = None
 
-    book_output_budget = choose_output_tokens(
-        book_prompt,
-        cap=args.max_tokens_book,
-        minimum=(args.reasoning_min_output_tokens if effective_reasoning != "off" else args.min_output_tokens),
-        ratio=(args.reasoning_output_ratio if effective_reasoning != "off" else args.output_ratio),
-    )
-    print(
-        f"Book summary input: ~{estimate_tokens(book_prompt):,} tokens, "
-        f"output budget: {book_output_budget:,}"
-    )
+    if cached_book_summary is not None:
+        final_summary = str(cached_book_summary["summary"]).strip()
+        final_usage = cached_book_summary.get("usage") or {}
+        final_elapsed = float(cached_book_summary.get("elapsed_seconds", 0.0) or 0.0)
+        print("\nComplete-book summary: [CACHED]")
+        p, c, r = usage_totals(final_usage)
+        total_prompt_tokens += p
+        total_completion_tokens += c
+        total_reasoning_tokens += r
+        total_elapsed += final_elapsed
+    else:
+        print("\nGenerating complete-book summary...")
 
-    final_summary, final_usage, final_elapsed = chat(
-        args.base_url,
-        model,
-        book_prompt,
-        book_output_budget,
-        args.temperature,
-        args.timeout,
-        effective_reasoning,
-    )
+        book_prompt = BOOK_PROMPT.format(
+            book_title=book_title,
+            book_language=book_language or "metadata unavailable",
+            summary_language=summary_language,
+            summaries="\n\n".join(all_chapter_summaries),
+        )
 
-    total_elapsed += final_elapsed
-    total_prompt_tokens += int(final_usage.get("prompt_tokens", 0) or 0)
-    total_completion_tokens += int(
-        final_usage.get("completion_tokens", 0) or 0
-    )
-    total_reasoning_tokens += int(final_usage.get("reasoning_tokens", 0) or 0)
+        book_output_budget = choose_output_tokens(
+            book_prompt,
+            cap=args.max_tokens_book,
+            minimum=(
+                args.reasoning_min_output_tokens
+                if effective_reasoning != "off"
+                else args.min_output_tokens
+            ),
+            ratio=(
+                args.reasoning_output_ratio
+                if effective_reasoning != "off"
+                else args.output_ratio
+            ),
+        )
+        print(
+            f"Book summary input: ~{estimate_tokens(book_prompt):,} tokens, "
+            f"output budget: {book_output_budget:,}"
+        )
 
-    (output_dir / "book_summary.md").write_text(
-        f"# {book_title}\n\n"
-        f"## Complete plot summary\n\n"
-        f"{final_summary}\n",
-        encoding="utf-8",
-    )
+        final_summary, final_usage, final_elapsed = chat(
+            args.base_url,
+            model,
+            book_prompt,
+            book_output_budget,
+            args.temperature,
+            args.timeout,
+            effective_reasoning,
+        )
 
-    save_json(
-        output_dir / "book_summary.json",
-        {
-            "book_title": book_title,
-            "model": model,
-            "model_dir": model_dir_name,
-            "run_id": run_id,
-            "summary": final_summary,
-            "elapsed_seconds": final_elapsed,
-            "usage": final_usage,
-        },
-    )
+        total_elapsed += final_elapsed
+        p, c, r = usage_totals(final_usage)
+        total_prompt_tokens += p
+        total_completion_tokens += c
+        total_reasoning_tokens += r
+
+        (output_dir / "book_summary.md").write_text(
+            f"# {book_title}\n\n"
+            f"## Complete plot summary\n\n"
+            f"{final_summary}\n",
+            encoding="utf-8",
+        )
+
+        save_json(
+            book_summary_path,
+            {
+                "book_title": book_title,
+                "model": model,
+                "model_dir": model_dir_name,
+                "run_id": run_id,
+                "summary": final_summary,
+                "elapsed_seconds": final_elapsed,
+                "usage": final_usage,
+            },
+        )
 
     save_json(
         output_dir / "run_stats.json",
@@ -981,6 +1219,18 @@ def run(args):
             "run_id": run_id,
             "model_info": model_info,
             "chapters": len(chapters),
+            "completed_chapters": sum(
+                1
+                for c in chapters
+                if (
+                    (
+                        output_dir
+                        / (f"{int(c.number):03d}" if c.number.isdigit() else "epilogue")
+                        / "chapter_summary.json"
+                    ).exists()
+                )
+            ),
+            "completed_book_summary": bool(cached_book_summary or (output_dir / "book_summary.json").exists()),
             "total_elapsed_seconds": total_elapsed,
             "total_prompt_tokens": total_prompt_tokens,
             "total_completion_tokens": total_completion_tokens,
@@ -995,6 +1245,7 @@ def run(args):
         print(f"Completion tokens: {total_completion_tokens:,}")
         print(f"Reasoning tokens:   {total_reasoning_tokens:,}")
     print(f"Results: {output_dir}")
+
 
 
 def main():
@@ -1082,6 +1333,11 @@ def main():
         choices=["off", "low", "medium", "high", "on"],
         default="off",
         help="Requested LM Studio reasoning mode. If unsupported by the loaded model, the script automatically uses a supported mode.",
+    )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="Resume exactly the specified benchmark run directory. Without this option a new run is always created.",
     )
     parser.add_argument(
         "--timeout",
