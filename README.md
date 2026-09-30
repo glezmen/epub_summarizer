@@ -1,52 +1,59 @@
 # EPUB LLM Benchmark
 
-A small, reproducible benchmark for comparing local LLMs on long-form EPUB summarization using [LM Studio](https://lmstudio.ai/) as the local inference server.
+A reproducible benchmark for comparing LLMs on long-form EPUB summarization. The benchmark uses [LM Studio](https://lmstudio.ai/) for local inference and can evaluate the generated summaries against a NotebookLM reference using a local LLM, Claude Code, OpenAI, or Anthropic evaluator.
 
-The benchmark:
+The project has two main scripts:
 
-- extracts chapters from an EPUB in reading order;
-- sends each chapter to the locally loaded LLM;
-- generates a factual summary for every chapter;
-- generates a complete-book summary from the chapter summaries;
-- automatically detects the currently loaded LM Studio model;
-- uses the loaded model's actual context length for chunking decisions;
-- dynamically chooses an output-token budget based on the input size;
-- records timing and token-usage information when provided by LM Studio;
-- stores every run separately so different models or repeated runs do not overwrite previous results.
+- `epub_llm_benchmark.py` — generates chapter-by-chapter and complete-book summaries.
+- `evaluate_summaries.py` — evaluates one or more completed model runs against a NotebookLM reference and the original EPUB.
 
-The intended use is to compare local models on **factual summarization quality**, for example by comparing their output against a manually prepared or NotebookLM-generated reference summary.
+## What is measured?
+
+The goal is not textual similarity. The benchmark is intended to measure factual summarization quality, including:
+
+- important-event coverage;
+- factual accuracy;
+- character/action accuracy;
+- cause-and-effect accuracy;
+- chronology;
+- important omissions;
+- unsupported or hallucinated claims;
+- importance of covered and omitted facts;
+- story-arc coverage;
+- generation and evaluation runtime;
+- token usage when reported by the inference backend.
+
+The original EPUB is treated as the primary factual source. NotebookLM provides a structured reference summary, but it is not assumed to be infallible. Important discrepancies can therefore be checked against the original book.
 
 ## Requirements
 
 - Python 3.10+ recommended
-- [LM Studio](https://lmstudio.ai/)
+- [LM Studio](https://lmstudio.ai/) for local summarization and/or local evaluation
 - A locally loaded chat/instruct LLM in LM Studio
 - LM Studio's local server enabled
 - An EPUB file
 
-The script uses only Python's standard library. No `pip install` is required.
+The scripts use only Python's standard library. No `pip install` is required for the local benchmark/evaluator.
 
-## LM Studio setup
+## 1. Generate summaries
 
-Load exactly one LLM in LM Studio before starting the benchmark.
+Load exactly one LLM instance in LM Studio before starting the benchmark.
 
-The script discovers the loaded model through LM Studio's native endpoint:
+The script discovers the loaded model through:
 
 ```text
 http://localhost:1234/api/v1/models
 ```
 
-It selects the LLM that has a non-empty `loaded_instances` list and reads the effective `context_length` from the loaded instance.
+It selects the LLM with a non-empty `loaded_instances` list and reads the effective `context_length` from the loaded instance. If multiple LLM instances are loaded, the script stops instead of guessing.
 
-If multiple LLM instances are loaded, the script stops instead of guessing which model should be benchmarked.
-
-The actual generation request uses LM Studio's OpenAI-compatible endpoint:
+Actual generation uses LM Studio's OpenAI-compatible endpoint:
 
 ```text
 http://localhost:1234/v1/chat/completions
 ```
 
-## Basic usage
+### Basic usage
 
 ```bash
 python3 epub_llm_benchmark.py "My Book.epub"
@@ -54,39 +61,41 @@ python3 epub_llm_benchmark.py "My Book.epub"
 
 Results are written to `./results` by default.
 
-Example:
+### Summary language
+
+By default summaries are generated in the source book's language:
 
 ```bash
-python3 epub_llm_benchmark.py \
-  "The Butchers Masquerade Dungeon Crawler Carl (Book 5).epub"
+python3 epub_llm_benchmark.py "My Book.epub"
 ```
 
-## Important options
-
-### Change the results directory
+English can be requested explicitly:
 
 ```bash
-python3 epub_llm_benchmark.py "My Book.epub" --output ./benchmark-results
+python3 epub_llm_benchmark.py "My Book.epub" --summary-language english
 ```
 
-### Change the LM Studio server
+An explicit ISO language code can also be supplied:
 
 ```bash
-python3 epub_llm_benchmark.py "My Book.epub" \
-  --base-url http://localhost:1234
+python3 epub_llm_benchmark.py "My Book.epub" --summary-language hu
+python3 epub_llm_benchmark.py "My Book.epub" --summary-language de
+python3 epub_llm_benchmark.py "My Book.epub" --summary-language fr
 ```
+
+`source` uses the EPUB language metadata when available and instructs the model to follow the source text language.
 
 ### Reasoning
 
-Reasoning is disabled by default, which is recommended for a summarization benchmark:
+Reasoning is disabled by default and is recommended for the baseline summarization benchmark:
 
-```bash
+```text
 --reasoning off
 ```
 
-The CLI value `off` is translated to LM Studio's API value `none`.
+The script translates `off` to LM Studio's API value `none`.
 
-Other supported modes are:
+Other modes are:
 
 ```text
 low
@@ -95,9 +104,7 @@ high
 xhigh
 ```
 
-`on` is also accepted and maps to `high`.
-
-For a reproducible factual-summary benchmark, keep reasoning disabled unless reasoning itself is one of the variables being tested.
+`on` is accepted and maps to `high`.
 
 ### Temperature
 
@@ -107,49 +114,39 @@ The default is:
 --temperature 0.0
 ```
 
-This is recommended for benchmark runs because it reduces sampling variability.
+This is recommended for reproducible benchmark runs.
 
 ## Context and chunking
 
-The script does **not** split every chapter into arbitrary fixed-size chunks.
+The script does not split every chapter into arbitrary fixed-size chunks.
 
-Instead, it estimates the input token count and checks whether the complete chapter fits into the available context after reserving space for the generated answer and prompt overhead.
+It estimates the input token count and checks whether the complete chapter fits into the available context after reserving space for the generated answer and prompt overhead. If it fits, the complete chapter is sent in one request.
 
-If it fits, the complete chapter is sent in one request.
+Only chapters that do not fit are split. Fallback chunks use a small character overlap.
 
-Only chapters that do not fit are split into deterministic chunks. A small overlap is used for those fallback chunks.
-
-The default overlap is 500 characters:
-
-```bash
---chunk-overlap 500
-```
-
-The context size is automatically taken from the loaded LM Studio instance. It can be overridden if necessary:
+The context size is taken automatically from the loaded LM Studio instance. It can be overridden when necessary:
 
 ```bash
 --context 32768
 ```
 
+The parser also filters common front matter and table-of-contents entries so that a TOC is not accidentally counted as a plot chapter.
+
 ## Dynamic output-token budget
 
-The script does not use one unnecessarily large output limit for every request.
+Output limits are adaptive rather than one fixed value for every request.
 
-It estimates the input size and selects an output budget based on:
-
-```text
-estimated input tokens × output ratio
-```
-
-The default ratio is `0.5`, with a minimum of 2048 tokens and the following maximum caps:
+The default budget is based on estimated input tokens, with these defaults:
 
 ```text
-Chapter/chunk summary:       4096
-Multi-chunk chapter merge:   4096
-Complete-book summary:       8192
+minimum:                  2048
+input/output ratio:       0.5
+chapter/chunk maximum:    4096
+chapter merge maximum:   4096
+book summary maximum:     8192
 ```
 
-These can be changed from the command line, for example:
+They can be changed with:
 
 ```bash
 --max-tokens-chunk 4096
@@ -159,13 +156,9 @@ These can be changed from the command line, for example:
 --output-ratio 0.5
 ```
 
-The output budget is only a generation limit. It does not mean the model will necessarily use that many tokens.
-
 ## Output structure
 
-Every execution gets its own timestamped directory.
-
-For example:
+Every execution gets its own timestamped directory, so repeated runs do not overwrite previous results.
 
 ```text
 results/
@@ -179,8 +172,7 @@ results/
     │   │   ├── chunk_01.json
     │   │   └── chapter_summary.json
     │   ├── 002/
-    │   │   ├── chunk_01.json
-    │   │   └── chapter_summary.json
+    │   │   └── ...
     │   └── ...
     └── run-20260930-150301/
         └── ...
@@ -198,130 +190,257 @@ becomes:
 qwen-qwen3.8-27b
 ```
 
-This allows several models and several runs of the same model to coexist without overwriting earlier results.
+## 2. Evaluate summaries
 
-## Generated files
+Once one or more model runs are available, use the evaluator script with:
 
-### `book_info.json`
+1. the original EPUB;
+2. the NotebookLM-generated reference summary;
+3. the `results` directory produced by `epub_llm_benchmark.py`.
 
-Contains benchmark configuration and model information, including:
+```bash
+python3 evaluate_summaries.py \
+  "My Book.epub" \
+  notebooklm_summary.md \
+  results
+```
 
-- book title and source filename;
-- model key and model metadata;
-- selected variant and quantization information when provided by LM Studio;
+The evaluator discovers all `model/run-*` directories under `results`, so multiple models and repeated runs can be evaluated in one invocation.
+
+### Evaluation model backends
+
+The evaluator supports four backends:
+
+```text
+local
+claude-code
+openai
+anthropic
+```
+
+#### Local LM Studio evaluator
+
+Default:
+
+```bash
+python3 evaluate_summaries.py book.epub notebooklm_summary.md results
+```
+
+The evaluator automatically detects the loaded LM Studio LLM in the same way as the benchmark script.
+
+#### Claude Code evaluator
+
+If Claude Code is already installed and authenticated, no Anthropic API key is required:
+
+```bash
+python3 evaluate_summaries.py \
+  book.epub \
+  notebooklm_summary.md \
+  results \
+  --evaluator claude-code \
+  --evaluator-model opus
+```
+
+`opus` is the default Claude Code model alias for this backend; `sonnet` can also be selected when supported by the installed Claude Code version.
+
+This uses the local `claude` CLI and therefore uses the Claude Code authentication available on the machine. A Claude web subscription and Anthropic API access are separate mechanisms; this backend specifically uses the authenticated Claude Code CLI.
+
+#### OpenAI API evaluator
+
+```bash
+export OPENAI_API_KEY="..."
+
+python3 evaluate_summaries.py \
+  book.epub \
+  notebooklm_summary.md \
+  results \
+  --evaluator openai \
+  --evaluator-model <model-id>
+```
+
+OpenAI API access and ChatGPT subscriptions are separate. The script requires an API key for this backend.
+
+#### Anthropic API evaluator
+
+```bash
+export ANTHROPIC_API_KEY="..."
+
+python3 evaluate_summaries.py \
+  book.epub \
+  notebooklm_summary.md \
+  results \
+  --evaluator anthropic \
+  --evaluator-model <model-id>
+```
+
+Anthropic API access and Claude subscriptions are separate. The script requires an API key for this backend.
+
+### Evaluator options
+
+Useful options include:
+
+```bash
+--evaluator local|claude-code|openai|anthropic
+--evaluator-model MODEL
+--temperature 0.0
+--reasoning off
+--max-tokens-facts 4096
+--max-tokens-eval 4096
+--max-tokens-book-eval 8192
+```
+
+For reproducible evaluation, use temperature `0.0` and keep the evaluator configuration identical across model runs.
+
+## Evaluation methodology
+
+The evaluator does not simply compare summary strings.
+
+### Reference facts
+
+The original EPUB is parsed into chapters and the NotebookLM reference is mapped to those chapters. The evaluator LLM extracts atomic facts and assigns an importance level:
+
+```text
+critical
+major
+moderate
+minor
+```
+
+### Coverage
+
+Each reference fact is checked against the model summary:
+
+```text
+supported
+partially_supported
+missing
+contradicted
+```
+
+This makes it possible to distinguish a missing minor detail from a missing critical plot event.
+
+### Model claims
+
+The evaluator also checks claims made by the model summary for unsupported or contradictory information. This captures hallucinations and factual distortions that a simple reference-recall metric would miss.
+
+### Story-level quality
+
+The evaluation can also assess broader plot coverage, including story arcs, major turning points, consequences, and the overall representation of the story.
+
+### Runtime and model metadata
+
+The final report includes, where available:
+
+- source model name/key;
+- model variant and quantization;
+- parameter information reported by LM Studio;
 - context length;
-- temperature;
 - reasoning mode;
-- output-budget settings;
-- chapter metadata.
+- temperature;
+- output-token settings;
+- total and per-chapter runtime;
+- input/output token usage;
+- evaluator provider and model;
+- evaluator configuration.
 
-### `chunk_XX.json`
+This allows quality to be considered together with generation cost/time rather than using a single quality score in isolation.
 
-Created for every model request used to summarize a chapter chunk.
+## Evaluation output
 
-Contains:
-
-- chapter/chunk identification;
-- generated summary;
-- elapsed time;
-- LM Studio usage information when available.
-
-### `chapter_summary.json`
-
-Contains the final summary for one chapter. For a chapter that fits into one request, this is the direct model response. For a multi-chunk chapter, it is the result of the additional merge step.
-
-### `book_summary.md`
-
-Human-readable complete-book summary.
-
-### `book_summary.json`
-
-The complete-book summary plus timing and usage information.
-
-### `run_stats.json`
-
-Aggregated timing and token-usage statistics for the run.
-
-## Benchmark methodology
-
-For meaningful model comparisons, keep the benchmark parameters identical between runs.
-
-Recommended baseline:
+The evaluator creates a separate timestamped directory, for example:
 
 ```text
-Temperature: 0.0
-Reasoning:   off
-Context:     model's loaded context length
-Chunking:    automatic
+results/
+└── evaluation/
+    └── run-20260930-160000/
+        ├── evaluator_info.json
+        ├── reference_facts.json
+        ├── reference/
+        ├── qwen-qwen3.8-27b/
+        │   └── run-20260930-134512/
+        │       ├── 001.json
+        │       ├── ...
+        │       ├── evaluation.json
+        │       └── book_evaluation.json
+        ├── evaluation.json
+        ├── report.md
+        └── report.html
 ```
 
-The same EPUB and the same prompts should be used for every model.
+`report.html` is intended as the main human-readable result.
 
-A useful evaluation workflow is:
+The evaluation report should show both aggregate metrics and concrete error examples, especially:
+
+- critical omissions;
+- major omissions;
+- unsupported claims;
+- contradictions;
+- chapter-level weaknesses.
+
+## Recommended benchmark workflow
+
+For each model, keep the generation settings identical unless the setting itself is being tested.
 
 ```text
-EPUB
- │
- ├──> Model A ──> chapter summaries ──> complete summary
- │
- ├──> Model B ──> chapter summaries ──> complete summary
- │
- └──> Model C ──> chapter summaries ──> complete summary
-                  
-Reference summary (e.g. NotebookLM)
-                  │
-                  └──> factual comparison / evaluation
+                    EPUB
+                      │
+          ┌───────────┼───────────┐
+          ▼           ▼           ▼
+       Model A     Model B     Model C
+          │           │           │
+          ▼           ▼           ▼
+      summaries   summaries   summaries
+          │           │           │
+          └───────────┼───────────┘
+                      ▼
+              NotebookLM reference
+                      │
+                      ▼
+             evaluate_summaries.py
+                      │
+             ┌────────┼─────────┐
+             ▼        ▼         ▼
+           Local   Claude Code  API
+             │        │         │
+             └────────┼─────────┘
+                      ▼
+                benchmark report
 ```
 
-The goal should be to measure more than textual similarity. Useful evaluation dimensions include:
+For a serious comparison, it is useful to evaluate the same summaries with more than one independent evaluator. Disagreements between evaluators should be inspected rather than silently averaged away.
 
-- important-event coverage;
-- factual accuracy;
-- character/action accuracy;
-- causal-relationship accuracy;
-- chronological accuracy;
-- important omissions;
-- hallucinated events or details.
+## Legacy runs
 
-A reference summary should be treated as a benchmark reference rather than unquestionable ground truth. When an important discrepancy appears, the original EPUB text should be used to verify the fact.
+Older benchmark runs may have been produced by an earlier version of the script using:
 
-## Privacy
+```text
+results/model/
+```
 
-The book text is sent to the LM Studio server configured by `--base-url`. With the default configuration, inference is performed locally on the machine running LM Studio.
+instead of the current:
 
-The script does not intentionally send the EPUB text to a remote API.
+```text
+results/<model-key>/run-<timestamp>/
+```
+
+Such a run can be migrated manually after it finishes. It does not need to be regenerated solely because the directory structure changed.
+
+## Privacy and external evaluation
+
+With the default benchmark configuration, EPUB text is sent to the local LM Studio server.
+
+When `evaluate_summaries.py` uses `claude-code`, `openai`, or `anthropic`, the relevant reference/model-summary content is sent to that external evaluator. Do not use an external evaluator for copyrighted, confidential, or otherwise sensitive material unless you are permitted to do so.
+
+API keys must never be committed to the Git repository.
 
 ## Limitations
 
-- Chapter detection is based on numbered headings (`1`, `2`, `3`, ...) and an `EPILOGUE` heading.
-- EPUBs with a different chapter structure may require changes to the chapter detector.
-- Token counts used for chunk decisions are estimates; actual tokenization is model-dependent.
-- Timing and token statistics depend on what LM Studio reports through its API.
-- The benchmark measures summarization behavior, not general model quality.
-
-## Example console output
-
-```text
-==========================================================
- EPUB LLM BENCHMARK
-==========================================================
-
-Book:       The Butcher's Masquerade: Dungeon Crawler Carl Book 5
-Chapters:   76 + Epilogue
-Model:      Qwen3.8 27B
-Model key:  qwen/qwen3.8-27b
-Variant:    qwen/qwen3.8-27b@4bit
-Quant:      4bit
-API:        http://localhost:1234
-Temperature:0.0
-Reasoning:  off
-Context:    61,696 tokens
-Chunking:   whole chapter when it fits
-Output:     /.../results/qwen-qwen3.8-27b/run-20260930-134512
-Run ID:     run-20260930-134512
-
-[01/76] Chapter 1: 27,109 chars, ~7,745 input tokens, output budget 4,096, 1 chunk(s), ETA ~calculating...
-```
+- EPUB chapter structures vary. The parser handles common numbered headings, `Chapter N` headings, epilogues, and several common TOC/front-matter patterns, but unusual EPUBs may still require parser adjustments.
+- Estimated token counts are approximate and model-dependent.
+- Runtime and token statistics depend on what the inference backend reports.
+- NotebookLM is a reference source, not an infallible ground-truth oracle.
+- LLM-based evaluation is itself imperfect. Important disagreements should be checked against the original EPUB.
+- The benchmark measures summarization behavior, not general model intelligence or overall model quality.
 
 ## License
 

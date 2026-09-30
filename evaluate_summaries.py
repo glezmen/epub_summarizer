@@ -534,29 +534,47 @@ def dynamic_budget(text: str, cap: int, minimum: int) -> int:
 # ---------------------------------------------------------------------------
 
 CHAPTER_HEADING_RE = re.compile(
-    r"^\s{0,3}(?:#{1,6}\s*)?(?:chapter\s+(\d+)\b.*|(\d+)\.\s+.+)$",
+    r"^\s{0,3}#{1,6}\s*Chapter\s+(\d+)\b.*$|^\s*Chapter\s+(\d+)\b.*$",
     re.I | re.M,
 )
-EPILOGUE_HEADING_RE = re.compile(r"^\s{0,3}(?:#{1,6}\s*)?epilogue\b.*$", re.I | re.M)
+EPILOGUE_HEADING_RE = re.compile(
+    r"^\s{0,3}#{1,6}\s*Epilogue\b.*$|^\s*Epilogue\b.*$",
+    re.I | re.M,
+)
 
 
 def parse_reference_sections(text: str) -> dict[str, str]:
-    """Parse Markdown-like NotebookLM chapter headings into sections."""
-    matches = []
+    """Parse NotebookLM chapter sections by explicit Chapter N headings.
+
+    NotebookLM may emit headings such as ``### Chapter 1 — The Hunt``.
+    We deliberately do not use the prose inside the heading as the key;
+    chapter number is the stable identifier shared with the EPUB.
+    """
+    text = text.replace("\ufeff", "")
+    matches: list[tuple[int, int, str]] = []
+
     for m in CHAPTER_HEADING_RE.finditer(text):
         key = m.group(1) or m.group(2)
         if key:
             matches.append((m.start(), m.end(), key))
+
     for m in EPILOGUE_HEADING_RE.finditer(text):
         matches.append((m.start(), m.end(), "EPILOGUE"))
-    matches.sort()
 
+    matches.sort(key=lambda x: x[0])
     sections: dict[str, str] = {}
     for i, (start, end, key) in enumerate(matches):
         next_start = matches[i + 1][0] if i + 1 < len(matches) else len(text)
-        section = text[end:next_start].strip()
-        sections[key] = section
+        sections[key] = text[end:next_start].strip()
     return sections
+
+
+def render_prompt(template: str, **values: object) -> str:
+    """Substitute only named prompt placeholders, leaving JSON braces intact."""
+    rendered = template
+    for key, value in values.items():
+        rendered = rendered.replace("{" + key + "}", str(value))
+    return rendered
 
 
 def load_model_runs(results_dir: Path) -> list[Path]:
@@ -1018,7 +1036,8 @@ def run(args):
             print(f"  [{pos:02d}/{len(chapters)}] {chapter.title}: no matching NotebookLM section")
             all_reference_facts[chapter.number] = []
             continue
-        prompt = FACT_PROMPT.format(
+        prompt = render_prompt(
+            FACT_PROMPT,
             book_title=book_title,
             book_language=book_language or "same as source text",
             chapter_title=chapter.title,
@@ -1093,8 +1112,10 @@ def run(args):
                 continue
 
             facts_text = json.dumps(facts, ensure_ascii=False, indent=2)
-            prompt = EVAL_PROMPT.format(
+            prompt = render_prompt(
+                EVAL_PROMPT,
                 book_title=book_title,
+                book_language=book_language or "same as source text",
                 chapter_title=chapter.title,
                 facts=facts_text,
                 summary=summary,
@@ -1148,8 +1169,8 @@ def run(args):
         summary = read_book_summary(run_dir)
         if not summary:
             continue
-        prompt = BOOK_EVAL_PROMPT.format(
-            book_title=book_title,
+        prompt = render_prompt(
+            BOOK_EVAL_PROMPT,
             facts=facts_text,
             summary=summary,
         )
