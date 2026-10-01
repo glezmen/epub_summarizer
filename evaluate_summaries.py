@@ -487,7 +487,10 @@ def chat(
                 f"completion_tokens={usage.get('completion_tokens', 0)}, "
                 f"reasoning_tokens={details.get('reasoning_tokens', 0)}"
             )
-        return content, usage, elapsed, {"provider": "local", "finish_reason": finish_reason}
+        return content, usage, elapsed, {
+            "provider": "local",
+            "finish_reason": finish_reason,
+        }
     if provider == "openai":
         return cloud_chat_openai(model, system, user, max_tokens, temperature, reasoning, timeout)
     if provider == "anthropic":
@@ -517,77 +520,6 @@ def extract_json(text: str) -> Any:
         except json.JSONDecodeError:
             continue
     raise RuntimeError("Evaluator response did not contain valid JSON.")
-
-
-def chat_json_with_retry(
-    provider: str,
-    base_url: str,
-    model: str,
-    system: str,
-    user: str,
-    initial_max_tokens: int,
-    max_tokens_cap: int,
-    temperature: float,
-    reasoning: str,
-    timeout: int,
-    label: str,
-) -> tuple[Any, dict, float, dict, int]:
-    """Run a JSON-producing evaluator request, retrying truncated local responses.
-
-    A local LM Studio response with finish_reason=length is retried with a larger
-    output budget. Other invalid-JSON responses are not silently retried.
-    """
-    budgets = []
-    budget = max(1, min(initial_max_tokens, max_tokens_cap))
-    while True:
-        if budget not in budgets:
-            budgets.append(budget)
-        if budget >= max_tokens_cap:
-            break
-        next_budget = min(max_tokens_cap, max(budget * 2, 4096))
-        if next_budget == budget:
-            break
-        budgets.append(next_budget)
-        budget = next_budget
-        if budget >= max_tokens_cap:
-            break
-
-    # De-duplicate while preserving order.
-    budgets = list(dict.fromkeys(budgets))
-    total_elapsed = 0.0
-    total_usage: dict[str, int] = {}
-    last_error: Exception | None = None
-
-    for attempt, current_budget in enumerate(budgets, 1):
-        raw, usage, elapsed, info = chat(
-            provider, base_url, model, system, user, current_budget,
-            temperature, reasoning, timeout
-        )
-        total_elapsed += elapsed
-        for key, value in usage.items():
-            if isinstance(value, (int, float)):
-                total_usage[key] = total_usage.get(key, 0) + int(value)
-        try:
-            parsed = extract_json(raw)
-            if attempt > 1:
-                print(
-                    f"    {label}: JSON succeeded after retry "
-                    f"with {current_budget} output tokens"
-                )
-            return parsed, total_usage, total_elapsed, info, current_budget
-        except RuntimeError as exc:
-            last_error = exc
-            finish_reason = info.get("finish_reason")
-            if finish_reason != "length" or attempt >= len(budgets):
-                raise
-            next_budget = budgets[attempt]
-            print(
-                f"    {label}: JSON truncated at {current_budget} tokens "
-                f"(finish_reason=length); retrying with {next_budget}..."
-            )
-
-    assert last_error is not None
-    raise last_error
 
 
 def estimate_tokens(text: str) -> int:
@@ -811,6 +743,111 @@ REFERENCE FACTS:
 LOCAL COMPLETE-BOOK SUMMARY:
 {summary}
 """
+
+
+
+# ---------------------------------------------------------------------------
+# Robust JSON evaluation helper
+# ---------------------------------------------------------------------------
+
+def chat_json_with_retry(
+    *,
+    provider: str,
+    base_url: str,
+    model: str,
+    system: str,
+    prompt: str,
+    initial_budget: int,
+    max_budget: int,
+    temperature: float,
+    reasoning: str,
+    timeout: int,
+    stage: str,
+) -> tuple[dict, dict, float, dict]:
+    """Run an evaluator request and retry truncated/invalid JSON responses.
+
+    The local LM Studio backend reports finish_reason='length' when the JSON
+    is cut off by max_tokens. Some providers do not expose the same field, so
+    invalid JSON is also retried conservatively. The helper never accepts a
+    partial JSON document as a valid evaluation.
+    """
+    budgets = []
+    b = max(1, min(initial_budget, max_budget))
+    while True:
+        budgets.append(b)
+        if b >= max_budget:
+            break
+        # Grow quickly enough to escape truncation, but never exceed max_budget.
+        nb = min(max_budget, max(b + 1024, b * 2))
+        if nb == b:
+            break
+        b = nb
+
+    total_elapsed = 0.0
+    total_prompt = 0
+    total_completion = 0
+    last_error = None
+    last_info = {}
+
+    for attempt, budget in enumerate(budgets, 1):
+        if attempt > 1:
+            print(
+                f"      [{stage}] JSON retry {attempt}/{len(budgets)} "
+                f"with max_tokens={budget}"
+            )
+
+        try:
+            raw, usage, elapsed, info = chat(
+                provider,
+                base_url,
+                model,
+                system,
+                prompt,
+                budget,
+                temperature,
+                reasoning,
+                timeout,
+            )
+        except Exception as exc:
+            last_error = exc
+            # Transport/API errors are not JSON truncation errors. Do not
+            # blindly repeat them unless there is another budget to try.
+            if attempt >= len(budgets):
+                raise
+            continue
+
+        total_elapsed += elapsed
+        total_prompt += int(usage.get("prompt_tokens", 0) or 0)
+        total_completion += int(usage.get("completion_tokens", 0) or 0)
+        last_info = info or {}
+
+        finish_reason = (last_info or {}).get("finish_reason")
+        try:
+            parsed = extract_json(raw)
+            if not isinstance(parsed, dict):
+                raise ValueError("Top-level JSON value is not an object.")
+            usage_total = dict(usage)
+            usage_total["prompt_tokens"] = total_prompt
+            usage_total["completion_tokens"] = total_completion
+            usage_total["attempts"] = attempt
+            usage_total["max_tokens_used"] = budget
+            return parsed, usage_total, total_elapsed, last_info
+        except Exception as exc:
+            last_error = exc
+            is_truncated = finish_reason == "length"
+
+            if attempt < len(budgets):
+                reason = "finish_reason=length" if is_truncated else "invalid JSON"
+                print(
+                    f"      [{stage}] {reason}; retrying with a larger "
+                    f"output budget..."
+                )
+                continue
+
+    raise RuntimeError(
+        f"Evaluator response did not contain valid JSON after {len(budgets)} "
+        f"attempt(s) for {stage}: {last_error}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1153,25 +1190,19 @@ def run(args):
             reference=reference_section,
             source=chapter.text,
         )
-        budget = min(
-            args.max_tokens_facts,
-            max(
-                args.min_output_tokens,
-                dynamic_budget(prompt, args.max_tokens_facts, args.min_output_tokens),
-            ),
-        )
-        parsed, usage, elapsed, _, used_budget = chat_json_with_retry(
-            args.evaluator,
-            args.base_url,
-            evaluator_model,
-            SYSTEM,
-            prompt,
-            budget,
-            args.max_tokens_facts,
-            args.temperature,
-            args.reasoning,
-            args.timeout,
-            label=f"Chapter {chapter.number} reference facts",
+        budget = min(args.max_tokens_facts, max(args.min_output_tokens, dynamic_budget(prompt, args.max_tokens_facts, args.min_output_tokens)))
+        parsed, usage, elapsed, _ = chat_json_with_retry(
+            provider=args.evaluator,
+            base_url=args.base_url,
+            model=evaluator_model,
+            system=SYSTEM,
+            prompt=prompt,
+            initial_budget=budget,
+            max_budget=args.max_tokens_facts,
+            temperature=args.temperature,
+            reasoning=args.reasoning,
+            timeout=args.timeout,
+            stage=f"reference {chapter.number}",
         )
         facts = parsed.get("facts", []) if isinstance(parsed, dict) else []
         # Ensure stable IDs even if evaluator omitted/duplicated IDs.
@@ -1192,7 +1223,6 @@ def run(args):
             "facts": normalized,
             "elapsed_seconds": elapsed,
             "usage": usage,
-            "max_output_tokens": used_budget,
         })
         reference_elapsed += elapsed
         ref_prompt_tokens += int(usage.get("prompt_tokens", 0) or 0)
@@ -1264,8 +1294,19 @@ def run(args):
                 source=chapter.text,
             )
             budget = min(args.max_tokens_eval, max(args.min_output_tokens, dynamic_budget(prompt, args.max_tokens_eval, args.min_output_tokens)))
-            raw, usage, elapsed, _ = chat(args.evaluator, args.base_url, evaluator_model, SYSTEM, prompt, budget, args.temperature, args.reasoning, args.timeout)
-            parsed = extract_json(raw)
+            parsed, usage, elapsed, _ = chat_json_with_retry(
+                provider=args.evaluator,
+                base_url=args.base_url,
+                model=evaluator_model,
+                system=SYSTEM,
+                prompt=prompt,
+                initial_budget=budget,
+                max_budget=args.max_tokens_eval,
+                temperature=args.temperature,
+                reasoning=args.reasoning,
+                timeout=args.timeout,
+                stage=f"chapter evaluation {model_key}/{chapter.number}",
+            )
             result = {
                 "chapter": chapter.number,
                 "title": chapter.title,
@@ -1328,8 +1369,19 @@ def run(args):
             summary=summary,
         )
         budget = min(args.max_tokens_book_eval, max(args.min_output_tokens, dynamic_budget(prompt, args.max_tokens_book_eval, args.min_output_tokens)))
-        raw, usage, elapsed, _ = chat(args.evaluator, args.base_url, evaluator_model, SYSTEM, prompt, budget, args.temperature, args.reasoning, args.timeout)
-        parsed = extract_json(raw)
+        parsed, usage, elapsed, _ = chat_json_with_retry(
+            provider=args.evaluator,
+            base_url=args.base_url,
+            model=evaluator_model,
+            system=SYSTEM,
+            prompt=prompt,
+            initial_budget=budget,
+            max_budget=args.max_tokens_book_eval,
+            temperature=args.temperature,
+            reasoning=args.reasoning,
+            timeout=args.timeout,
+            stage=f"book evaluation {item['model']}",
+        )
         result = {
             "model": item["model"],
             "run_dir": item["run_dir"],
@@ -1393,8 +1445,8 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0, help="Evaluator temperature (default: 0.0)")
     parser.add_argument("--reasoning", choices=["off", "low", "medium", "high", "xhigh", "on"], default="off")
     parser.add_argument("--max-tokens-facts", type=int, default=8192, help="Max tokens per chapter reference-fact extraction")
-    parser.add_argument("--max-tokens-eval", type=int, default=4096, help="Max tokens per chapter evaluation")
-    parser.add_argument("--max-tokens-book-eval", type=int, default=4096, help="Max tokens for complete-book evaluation")
+    parser.add_argument("--max-tokens-eval", type=int, default=8192, help="Max tokens per chapter evaluation")
+    parser.add_argument("--max-tokens-book-eval", type=int, default=8192, help="Max tokens for complete-book evaluation")
     parser.add_argument("--min-output-tokens", type=int, default=2048)
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument(
