@@ -466,41 +466,46 @@ def chat(
     timeout: int,
     reasoning: str,
     send_reasoning: bool = True,
+    reasoning_max_tokens: Optional[int] = None,
+    final_answer_tokens: int = 512,
 ) -> tuple[str, dict, float]:
-    """Call LM Studio's native v1 chat API.
+    """Call LM Studio and return the final message plus authoritative stats.
 
-    The native API is preferred over /v1/chat/completions because it exposes
-    reasoning as a first-class request option and returns authoritative
-    inference statistics (including reasoning tokens and generation speed).
+    LM Studio's native v1 API exposes one combined `max_output_tokens` budget;
+    it does not expose a separate reasoning-token ceiling. Therefore the
+    benchmark can reserve a final-answer budget by capping the total request
+    and, when a reasoning-only response is returned, retrying through the
+    OpenAI-compatible endpoint. The latter is also useful for model families
+    whose native reasoning parser returns reasoning but no final message.
     """
-    url = base_url.rstrip("/") + "/api/v1/chat"
+    # For reasoning models, split the configured total output budget into two
+    # independent passes. The first pass gets the reasoning allowance; if it
+    # produces no final message, the fallback gets the remaining final-answer
+    # allowance. This keeps the combined benchmark budget bounded.
+    total_budget = max(1, int(max_tokens))
+    if reasoning_max_tokens is not None and reasoning != "off":
+        requested_final = max(1, int(final_answer_tokens))
+        # Never let the reasoning allowance consume the entire combined budget.
+        # If the dynamic total is smaller than the requested final-answer
+        # reserve, split the available budget roughly evenly.
+        final_answer_budget = min(requested_final, max(1, total_budget // 2))
+        reasoning_budget = min(
+            max(1, int(reasoning_max_tokens)),
+            max(1, total_budget - final_answer_budget),
+        )
+        first_budget = reasoning_budget
+    else:
+        reasoning_budget = 0
+        final_answer_budget = total_budget
+        first_budget = total_budget
 
-    payload = {
-        "model": model,
-        "input": prompt,
-        "system_prompt": (
-            "You are a precise literary text summarizer. "
-            "You must only use information present in the supplied text. "
-            "Do not invent events, characters, motivations, or facts."
-        ),
-        "temperature": temperature,
-        "max_output_tokens": max_tokens,
-        "stream": False,
-    }
+    system_prompt = (
+        "You are a precise literary text summarizer. "
+        "You must only use information present in the supplied text. "
+        "Do not invent events, characters, motivations, or facts."
+    )
 
-    # Some LM Studio models do not expose a reasoning configuration at all.
-    # When metadata is unavailable and reasoning=off was requested, sending
-    # "reasoning": "off" can itself cause HTTP 400. Only include the field
-    # when the model explicitly exposes reasoning support, or when the user
-    # explicitly requested a non-off mode.
-    if send_reasoning:
-        payload["reasoning"] = reasoning
-
-    started = time.perf_counter()
-    response = api_request(url, payload, timeout)
-    elapsed = time.perf_counter() - started
-
-    try:
+    def parse_native(response: dict) -> tuple[str, dict]:
         output = response.get("output") or []
         message_parts = [
             item.get("content", "")
@@ -508,37 +513,140 @@ def chat(
             if isinstance(item, dict) and item.get("type") == "message"
         ]
         content = "\n".join(part for part in message_parts if part).strip()
+        reasoning_parts = [
+            item.get("content", "")
+            for item in output
+            if isinstance(item, dict) and item.get("type") == "reasoning"
+        ]
+        reasoning_content = "\n".join(part for part in reasoning_parts if part).strip()
         stats = response.get("stats") or {}
-    except (AttributeError, TypeError) as e:
-        raise RuntimeError(f"Unexpected LM Studio response: {response}") from e
+        input_tokens = int(stats.get("input_tokens", 0) or 0)
+        completion_tokens = int(stats.get("total_output_tokens", 0) or 0)
+        reasoning_tokens = int(stats.get("reasoning_output_tokens", 0) or 0)
+        usage = {
+            "prompt_tokens": input_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": input_tokens + completion_tokens,
+            "completion_tokens_details": {
+                "reasoning_tokens": reasoning_tokens,
+            },
+            "reasoning_tokens": reasoning_tokens,
+            "lmstudio_stats": stats,
+            "reasoning_content": reasoning_content,
+        }
+        return content, usage
 
-    # Keep the existing benchmark's usage shape, while also preserving the
-    # native LM Studio statistics verbatim for later analysis.
-    input_tokens = int(stats.get("input_tokens", 0) or 0)
-    completion_tokens = int(stats.get("total_output_tokens", 0) or 0)
-    reasoning_tokens = int(stats.get("reasoning_output_tokens", 0) or 0)
-    usage = {
+    def native_call(budget: int) -> tuple[str, dict, float]:
+        url = base_url.rstrip("/") + "/api/v1/chat"
+        payload = {
+            "model": model,
+            "input": prompt,
+            "system_prompt": system_prompt,
+            "temperature": temperature,
+            "max_output_tokens": budget,
+            "stream": False,
+        }
+        if send_reasoning:
+            payload["reasoning"] = reasoning
+
+        started = time.perf_counter()
+        response = api_request(url, payload, timeout)
+        elapsed = time.perf_counter() - started
+        content, usage = parse_native(response)
+        return content, usage, elapsed
+
+    # First try the native API.
+    content, usage, elapsed = native_call(first_budget)
+    if content:
+        return content, usage, elapsed
+
+    # If native returned reasoning but no final message, try the
+    # OpenAI-compatible endpoint. It exposes reasoning_content separately for
+    # some model families and can parse the final answer correctly.
+    #
+    # We intentionally do not feed the private reasoning text back into the
+    # prompt: the fallback should remain a faithful benchmark of the supplied
+    # source text, not a second-stage benchmark conditioned on hidden analysis.
+    url = base_url.rstrip("/") + "/v1/chat/completions"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": temperature,
+        "max_tokens": final_answer_budget,
+        "stream": False,
+    }
+
+    # Do not force a reasoning parameter on the fallback endpoint. This keeps
+    # the fallback compatible with models whose reasoning configuration is not
+    # exposed by the OpenAI-compatible endpoint.
+    started = time.perf_counter()
+    try:
+        response = api_request(url, payload, timeout)
+    except RuntimeError as fallback_error:
+        raise RuntimeError(
+            "LM Studio returned an empty final answer from the native /api/v1/chat "
+            f"endpoint. Native stats={usage.get('lmstudio_stats', {})}. "
+            "The OpenAI-compatible fallback also failed: "
+            f"{fallback_error}"
+        ) from fallback_error
+    fallback_elapsed = time.perf_counter() - started
+
+    choices = response.get("choices") or []
+    choice = choices[0] if choices else {}
+    message = choice.get("message") or {}
+    content = (message.get("content") or "").strip()
+    reasoning_content = (
+        message.get("reasoning_content")
+        or message.get("reasoning")
+        or ""
+    )
+    openai_usage = response.get("usage") or {}
+    input_tokens = int(
+        openai_usage.get("prompt_tokens", 0)
+        or openai_usage.get("input_tokens", 0)
+        or 0
+    )
+    completion_tokens = int(
+        openai_usage.get("completion_tokens", 0)
+        or openai_usage.get("output_tokens", 0)
+        or 0
+    )
+    details = openai_usage.get("completion_tokens_details") or {}
+    reasoning_tokens = int(
+        details.get("reasoning_tokens", 0)
+        or openai_usage.get("reasoning_tokens", 0)
+        or 0
+    )
+    fallback_usage = {
         "prompt_tokens": input_tokens,
         "completion_tokens": completion_tokens,
-        "total_tokens": input_tokens + completion_tokens,
+        "total_tokens": int(openai_usage.get("total_tokens", 0) or (input_tokens + completion_tokens)),
         "completion_tokens_details": {
             "reasoning_tokens": reasoning_tokens,
         },
         "reasoning_tokens": reasoning_tokens,
-        "lmstudio_stats": stats,
+        "lmstudio_stats": {
+            **openai_usage,
+            "endpoint": "/v1/chat/completions",
+            "finish_reason": choice.get("finish_reason"),
+        },
+        "reasoning_content": reasoning_content,
+        "fallback_from_native": True,
     }
 
     if not content:
         raise RuntimeError(
-            "LM Studio returned an empty final answer. "
-            f"input_tokens={input_tokens}, "
-            f"total_output_tokens={completion_tokens}, "
-            f"reasoning_output_tokens={reasoning_tokens}, "
-            f"stats={stats}. "
-            "The output budget may have been exhausted by reasoning."
+            "LM Studio returned an empty final answer from both endpoints. "
+            f"Native stats={usage.get('lmstudio_stats', {})}; "
+            f"OpenAI-compatible usage={openai_usage}; "
+            f"reasoning tokens={reasoning_tokens}."
         )
 
-    return content, usage, elapsed
+    # Preserve both requests in the measured elapsed time.
+    return content, fallback_usage, elapsed + fallback_elapsed
 
 
 # -----------------------------
@@ -898,6 +1006,8 @@ def run(args):
                 "output_ratio": args.output_ratio,
                 "reasoning_output_ratio": args.reasoning_output_ratio,
                 "reasoning_min_output_tokens": args.reasoning_min_output_tokens,
+                "reasoning_max_tokens": args.reasoning_max_tokens,
+                "final_answer_tokens": args.final_answer_tokens,
                 "max_tokens_chunk": args.max_tokens_chunk,
                 "max_tokens_merge": args.max_tokens_merge,
                 "max_tokens_book": args.max_tokens_book,
@@ -1052,6 +1162,8 @@ def run(args):
                     args.timeout,
                     effective_reasoning,
                     send_reasoning,
+                    args.reasoning_max_tokens,
+                    args.final_answer_tokens,
                 )
 
                 save_json(
@@ -1113,6 +1225,8 @@ def run(args):
                 args.timeout,
                 effective_reasoning,
                 send_reasoning,
+                args.reasoning_max_tokens,
+                args.final_answer_tokens,
             )
 
             total_elapsed += merge_elapsed
@@ -1201,6 +1315,8 @@ def run(args):
             args.timeout,
             effective_reasoning,
             send_reasoning,
+            args.reasoning_max_tokens,
+            args.final_answer_tokens,
         )
 
         total_elapsed += final_elapsed
@@ -1335,6 +1451,26 @@ def main():
         type=int,
         default=4096,
         help="Minimum output budget for reasoning models (default: 4096)",
+    )
+    parser.add_argument(
+        "--reasoning-max-tokens",
+        type=int,
+        default=8192,
+        help=(
+            "Maximum reasoning allowance used before reserving final-answer space "
+            "(default: 8192). LM Studio exposes one combined output budget, so this "
+            "is implemented as a bounded first-pass budget plus a final-answer reserve."
+        ),
+    )
+    parser.add_argument(
+        "--final-answer-tokens",
+        type=int,
+        default=8192,
+        help=(
+            "Final-answer token budget used for the fallback pass when reasoning "
+            "is enabled (default: 8192). The reasoning and final-answer budgets "
+            "together must stay within --max-tokens-*."
+        ),
     )
     parser.add_argument(
         "--temperature",
