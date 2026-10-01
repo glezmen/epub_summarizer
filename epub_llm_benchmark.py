@@ -465,6 +465,7 @@ def chat(
     temperature: float,
     timeout: int,
     reasoning: str,
+    send_reasoning: bool = True,
 ) -> tuple[str, dict, float]:
     """Call LM Studio's native v1 chat API.
 
@@ -484,9 +485,16 @@ def chat(
         ),
         "temperature": temperature,
         "max_output_tokens": max_tokens,
-        "reasoning": reasoning,
         "stream": False,
     }
+
+    # Some LM Studio models do not expose a reasoning configuration at all.
+    # When metadata is unavailable and reasoning=off was requested, sending
+    # "reasoning": "off" can itself cause HTTP 400. Only include the field
+    # when the model explicitly exposes reasoning support, or when the user
+    # explicitly requested a non-off mode.
+    if send_reasoning:
+        payload["reasoning"] = reasoning
 
     started = time.perf_counter()
     response = api_request(url, payload, timeout)
@@ -811,6 +819,14 @@ def run(args):
 
     model, model_info, detected_context, allowed_reasoning = get_loaded_model(args.base_url)
     effective_reasoning = resolve_reasoning(args.reasoning, allowed_reasoning, model_info)
+
+    # If reasoning capability metadata is unavailable, an explicit
+    # reasoning="off" is unsafe for some models: LM Studio may reject the
+    # field because the model does not expose reasoning configuration.
+    # If metadata explicitly lists supported options, keep sending the field
+    # so a requested "off" remains authoritative.
+    send_reasoning = bool(allowed_reasoning) or args.reasoning != "off"
+
     effective_context = args.context if args.context is not None else detected_context
 
     if args.resume:
@@ -1035,6 +1051,7 @@ def run(args):
                     args.temperature,
                     args.timeout,
                     effective_reasoning,
+                    send_reasoning,
                 )
 
                 save_json(
@@ -1095,6 +1112,7 @@ def run(args):
                 args.temperature,
                 args.timeout,
                 effective_reasoning,
+                send_reasoning,
             )
 
             total_elapsed += merge_elapsed
@@ -1182,6 +1200,7 @@ def run(args):
             args.temperature,
             args.timeout,
             effective_reasoning,
+            send_reasoning,
         )
 
         total_elapsed += final_elapsed
