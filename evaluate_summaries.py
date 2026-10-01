@@ -971,7 +971,7 @@ def run(args):
     if args.evaluator == "local":
         evaluator_model, evaluator_info, evaluator_context = get_loaded_model(args.base_url)
     elif args.evaluator == "claude-code":
-        evaluator_model = args.evaluator_model or "opus"
+        evaluator_model = args.evaluator_model or "haiku"
         evaluator_info = {
             "display_name": evaluator_model,
             "selected_variant": None,
@@ -1299,7 +1299,7 @@ def main():
     parser.add_argument("reference", help="NotebookLM-generated reference summary file")
     parser.add_argument("results", help="Results directory produced by epub_llm_benchmark.py")
     parser.add_argument("--evaluator", choices=["local", "claude-code", "openai", "anthropic"], default="local", help="Evaluator backend (default: local)")
-    parser.add_argument("--evaluator-model", help="Evaluator model ID; for claude-code defaults to 'opus'")
+    parser.add_argument("--evaluator-model", help="Evaluator model ID; for claude-code defaults to 'haiku'")
     parser.add_argument("--base-url", default="http://localhost:1234", help="LM Studio base URL for --evaluator local")
     parser.add_argument("--temperature", type=float, default=0.0, help="Evaluator temperature (default: 0.0)")
     parser.add_argument("--reasoning", choices=["off", "low", "medium", "high", "xhigh", "on"], default="off")
