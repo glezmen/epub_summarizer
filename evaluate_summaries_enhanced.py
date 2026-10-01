@@ -836,13 +836,14 @@ def markdown_report(path: Path, report: dict) -> None:
         "",
         "## Model comparison",
         "",
-        "| Model / run | Runtime | Weighted coverage | Critical | Major | Unsupported claims | Critical omissions | Major omissions |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| Model / run | Runtime | Story arc | Weighted coverage | Critical | Major | Unsupported claims | Critical omissions | Major omissions |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for item in report["models"]:
         a = item["aggregate"]
         lines.append(
             f"| `{item['label']}` | {item['runtime_minutes']:.1f} min | "
+            f"{pct(item.get('book_evaluation', {}).get('story_arc_coverage', 0))} | "
             f"{pct(a['weighted_coverage'])} | {pct(a['coverage']['critical'])} | "
             f"{pct(a['coverage']['major'])} | {a['claims']['unsupported']} | "
             f"{len(a['critical_omissions'])} | {len(a['major_omissions'])} |"
@@ -919,7 +920,7 @@ h1{margin:0 0 4px;font-size:26px}h2{margin:28px 0 12px}h3{margin:18px 0 8px}.mut
 .charts{grid-template-columns:1fr 1fr}.chart{min-height:260px;overflow:visible}.scatter{width:100%;height:300px;display:block}.legend{display:flex;flex-wrap:wrap;gap:12px 18px;margin:8px 0 14px}.legend-item{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)}.swatch{width:12px;height:12px;border-radius:3px;display:inline-block;border:1px solid #00000018}.barrow{display:grid;grid-template-columns:minmax(140px,1fr) 3fr 55px;gap:8px;align-items:center;margin:9px 0}.bar{height:18px;background:#edf0f2;border-radius:4px;overflow:hidden}.fill{height:100%;background:var(--accent)}.fill.good{background:var(--good)}
 .stack{display:flex;height:24px;border-radius:4px;overflow:hidden;background:#eee}.stack span{height:100%;min-width:1px}.supported{background:#48a868}.partial{background:#d4a72c}.missing{background:#cbd1d6}.contradicted{background:#d9534f}
 .sort{cursor:pointer;user-select:none;white-space:nowrap}.sort:after{content:" ↕";color:#9aa1a8}.sort.asc:after{content:" ↑"}.sort.desc:after{content:" ↓"}
-table{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%;background:white;table-layout:auto}th,td{border-bottom:1px solid var(--line);padding:8px;text-align:left;vertical-align:top}th{background:#f0f3f6;z-index:2;white-space:nowrap}th:first-child,td:first-child{min-width:220px}td{white-space:nowrap}.tablewrap{overflow-x:auto;overflow-y:visible;max-width:100%;-webkit-overflow-scrolling:touch}td.num,th.num{text-align:right}tr:hover td{background:#fafbfc}
+table{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%;background:white;table-layout:auto}th,td{border-bottom:1px solid var(--line);padding:8px;text-align:left;vertical-align:top}th{background:#f0f3f6;z-index:2;white-space:nowrap}th:first-child,td:first-child{min-width:220px}td{white-space:nowrap}.tablewrap{overflow-x:auto;overflow-y:visible;max-width:100%;-webkit-overflow-scrolling:touch}td.num,th.num{text-align:right}tr:hover td{background:#fafbfc}th.tip{position:relative;cursor:help}th.tip::after{content:"ⓘ";display:inline-block;margin-left:5px;font-size:11px;font-weight:600;color:#68737d;vertical-align:1px}.table-tooltip{position:fixed;z-index:9999;max-width:330px;padding:9px 11px;border-radius:7px;background:#17202a;color:#fff;font-size:12px;line-height:1.4;box-shadow:0 4px 14px rgba(0,0,0,.2);pointer-events:none;white-space:normal}
 .pill{display:inline-block;border-radius:999px;padding:2px 7px;font-size:12px;background:#edf0f2}.score{font-weight:700}.details{margin-top:12px}.details>summary{cursor:pointer;font-weight:700;padding:10px;background:#fff;border:1px solid var(--line);border-radius:8px}.details[open]>summary{border-radius:8px 8px 0 0}
 .detailbody{background:#fff;border:1px solid var(--line);border-top:0;padding:12px}.subdetails{margin:8px 0}.subdetails summary{cursor:pointer;font-weight:600}.issue{padding:7px 0;border-bottom:1px solid #eef0f2}.issue small{color:var(--muted)}
 .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted)}.dot{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px}
@@ -992,10 +993,12 @@ function resetWeights(){for(const [k,v] of Object.entries(defaults)){const id={c
 function label(m){return m.model_info?.display_name||m.model||m.label}
 function renderCards(){
  const avg=models.reduce((s,m)=>s+metrics(m).adjusted,0)/Math.max(1,models.length);
+ const avgStoryArc=models.reduce((s,m)=>s+(m.book_evaluation?.story_arc_coverage||0),0)/Math.max(1,models.length);
  const best=models.reduce((b,m)=>!b||metrics(m).adjusted>metrics(b).adjusted?m:b,null);
  const totalFacts=models.length?Object.values(models[0].aggregate.fact_counts).reduce((s,x)=>s+Object.values(x).reduce((a,b)=>a+b,0),0):0;
  document.getElementById("cards").innerHTML=[
  `<div class="card"><b>${models.length}</b><span>models included</span></div>`,
+ `<div class="card"><b>${pct(avgStoryArc)}</b><span>average story arc coverage</span></div>`,
  `<div class="card"><b>${pct(avg)}</b><span>average adjusted score</span></div>`,
  `<div class="card"><b>${pct(best?metrics(best).adjusted:0)}</b><span>highest adjusted score</span></div>`,
  `<div class="card"><b>${totalFacts}</b><span>reference facts / model</span></div>`,
@@ -1074,15 +1077,34 @@ function renderRuntimeCoverage(){
    `${dots}</svg>`;
 }
 const columns=[
- ["model","Model"],["adjusted","Adjusted"],["base","Base weighted"],["runtime","Runtime"],["critical","Critical"],["major","Major"],["moderate","Moderate"],["minor","Minor"],["contradicted","Contradictions"],["unsupported","Unsupported"],["criticalO","Critical omissions"],["majorO","Major omissions"]
+ ["model","Model","Model/run being compared."],["adjusted","Adjusted","Base weighted coverage after subtracting the omission, contradiction, and unsupported-claim penalties. The penalties use the current controls above."],["storyArc","Story arc","Evaluator's book-level assessment of how well the summary represents the broader story arcs, major turning points, consequences, and overall story."],["base","Base weighted","Weighted factual coverage before penalties. Fact importance weights and the partial-credit setting are applied, but omission/contradiction/unsupported-claim penalties are not."],["runtime","Runtime","Time required to generate the model's summary, in minutes."],["critical","Critical","Coverage of reference facts classified as critical. Supported facts count fully; partial facts receive the configured partial-credit value."],["major","Major","Coverage of reference facts classified as major."],["moderate","Moderate","Coverage of reference facts classified as moderate."],["minor","Minor","Coverage of reference facts classified as minor."],["contradicted","Contradictions","Number of model claims judged contradicted by the reference/source."],["unsupported","Unsupported","Number of model claims judged unsupported by the reference/source."],["criticalO","Critical omissions","Number of critical reference facts omitted or not adequately covered."],["majorO","Major omissions","Number of major reference facts omitted or not adequately covered."]
 ];
 let sortKey="adjusted",sortDir=-1;
 function renderHead(){
- document.getElementById("head").innerHTML=columns.map(([k,n])=>`<th class="${k!=="model"?"num":""} sort ${sortKey===k?(sortDir>0?"asc":"desc"):""}" onclick="sortBy('${k}')">${n}</th>`).join("");
+ document.getElementById("head").innerHTML=columns.map(([k,n,tip])=>`<th class="${k!=="model"?"num ":""}tip sort ${sortKey===k?(sortDir>0?"asc":"desc"):""}" data-tip="${esc(tip)}" onclick="sortBy('${k}')">${n}</th>`).join("");
+ document.querySelectorAll("#head th.tip").forEach(th=>{
+   th.addEventListener("mouseenter",()=>showTableTip(th));
+   th.addEventListener("mouseleave",hideTableTip);
+   th.addEventListener("focus",()=>showTableTip(th));
+   th.addEventListener("blur",hideTableTip);
+ });
 }
+let tableTipEl=null;
+function showTableTip(th){
+ if(tableTipEl)tableTipEl.remove();
+ tableTipEl=document.createElement("div"); tableTipEl.className="table-tooltip"; tableTipEl.textContent=th.dataset.tip||"";
+ document.body.appendChild(tableTipEl);
+ const r=th.getBoundingClientRect(), pad=8;
+ let left=Math.max(pad,Math.min(r.left,r.right-330));
+ let top=r.bottom+8;
+ const h=tableTipEl.offsetHeight;
+ if(top+h>window.innerHeight-pad)top=Math.max(pad,r.top-h-8);
+ tableTipEl.style.left=left+"px"; tableTipEl.style.top=top+"px";
+}
+function hideTableTip(){if(tableTipEl){tableTipEl.remove();tableTipEl=null;}}
 function rowValue(m,k){
  const a=m.aggregate,x=metrics(m);
- return {model:label(m),adjusted:x.adjusted,base:x.base,runtime:m.runtime_minutes||0,critical:a.coverage.critical||0,major:a.coverage.major||0,moderate:a.coverage.moderate||0,minor:a.coverage.minor||0,contradicted:a.claims?.contradicted||0,unsupported:a.claims?.unsupported||0,criticalO:a.critical_omissions?.length||0,majorO:a.major_omissions?.length||0}[k];
+ return {model:label(m),adjusted:x.adjusted,storyArc:m.book_evaluation?.story_arc_coverage||0,base:x.base,runtime:m.runtime_minutes||0,critical:a.coverage.critical||0,major:a.coverage.major||0,moderate:a.coverage.moderate||0,minor:a.coverage.minor||0,contradicted:a.claims?.contradicted||0,unsupported:a.claims?.unsupported||0,criticalO:a.critical_omissions?.length||0,majorO:a.major_omissions?.length||0}[k];
 }
 function renderTable(){
  const q=(document.getElementById("modelSearch").value||"").toLowerCase();
@@ -1090,7 +1112,7 @@ function renderTable(){
  arr.sort((a,b)=>{let x=rowValue(a,sortKey),y=rowValue(b,sortKey);if(typeof x==="string")return sortDir*x.localeCompare(y);return sortDir*(x-y)});
  document.getElementById("tbody").innerHTML=arr.map(m=>{const a=m.aggregate,x=metrics(m);return `<tr>
  <td><b>${esc(label(m))}</b><br><span class="muted">${esc(m.label)}</span></td>
- <td class="num score">${pct(x.adjusted)}</td><td class="num">${pct(x.base)}</td><td class="num">${mins(m.runtime_minutes)}</td>
+ <td class="num score">${pct(x.adjusted)}</td><td class="num score">${pct(m.book_evaluation?.story_arc_coverage||0)}</td><td class="num">${pct(x.base)}</td><td class="num">${mins(m.runtime_minutes)}</td>
  <td class="num">${pct(a.coverage.critical)}</td><td class="num">${pct(a.coverage.major)}</td><td class="num">${pct(a.coverage.moderate)}</td><td class="num">${pct(a.coverage.minor)}</td>
  <td class="num">${a.claims?.contradicted||0}</td><td class="num">${a.claims?.unsupported||0}</td><td class="num">${a.critical_omissions?.length||0}</td><td class="num">${a.major_omissions?.length||0}</td>
  </tr>`}).join("");
@@ -1103,10 +1125,10 @@ function issueList(arr,limit=100){
 function renderDetails(){
  document.getElementById("details").innerHTML=models.map((m,i)=>{const a=m.aggregate,x=metrics(m),mi=m.model_info||{},b=m.book_evaluation||{};
  const counts=a.fact_counts;
- return `<details class="details"><summary>${esc(label(m))} — <span class="score">${pct(x.adjusted)}</span> adjusted / ${pct(x.base)} base · ${mins(m.runtime_minutes)}</summary>
+ return `<details class="details"><summary>${esc(label(m))} — <span class="score">${pct(b.story_arc_coverage)}</span> story arc / <span class="score">${pct(x.base)}</span> weighted / <span class="score">${pct(x.adjusted)}</span> adjusted · ${mins(m.runtime_minutes)}</summary>
  <div class="detailbody">
  <div class="grid cards" style="margin:0 0 10px;grid-template-columns:repeat(auto-fit,minmax(120px,1fr))">
- <div class="card"><b>${pct(x.base)}</b><span>base weighted</span></div><div class="card"><b>${pct(x.adjusted)}</b><span>adjusted</span></div>
+ <div class="card"><b>${pct(b.story_arc_coverage)}</b><span>story arc coverage</span></div><div class="card"><b>${pct(x.base)}</b><span>base weighted</span></div><div class="card"><b>${pct(x.adjusted)}</b><span>adjusted</span></div>
  <div class="card"><b>${a.claims?.contradicted||0}</b><span>contradictions</span></div><div class="card"><b>${a.claims?.unsupported||0}</b><span>unsupported claims</span></div>
  </div>
  <p><b>Model:</b> ${esc(mi.display_name||m.model)} · <b>Key:</b> ${esc(m.model)} · <b>Variant:</b> ${esc(mi.selected_variant||"?")} · <b>Quantization:</b> ${esc(mi.quantization?.name||"?")} · <b>Runtime:</b> ${mins(m.runtime_minutes)} · <b>Prompt:</b> ${(m.prompt_tokens||0).toLocaleString()} · <b>Completion:</b> ${(m.completion_tokens||0).toLocaleString()}</p>
