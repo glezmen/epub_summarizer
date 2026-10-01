@@ -928,7 +928,7 @@ def markdown_report(path: Path, report: dict) -> None:
         f"- Model: `{report['evaluator']['display_name']}`",
         f"- Model key: `{report['evaluator']['model']}`",
         f"- Variant: `{report['evaluator'].get('selected_variant', '?')}`",
-        f"- Quantization: `{report['evaluator'].get('quantization', {}).get('name', '?')}`",
+        f"- Quantization: `{(report['evaluator'].get('quantization') or {}).get('name', '?')}`",
         f"- Context: `{report['evaluator']['context']:,}` tokens",
         f"- Temperature: `{report['evaluator']['temperature']}`",
         f"- Reasoning: `{report['evaluator']['reasoning']}`",
@@ -953,10 +953,10 @@ def markdown_report(path: Path, report: dict) -> None:
         lines += [
             f"### {item['label']}",
             "",
-            f"- Model: `{item['model_info'].get('display_name', item['model'])}`",
+            f"- Model: `{(item.get('model_info') or {}).get('display_name', item['model'])}`",
             f"- Model key: `{item['model']}`",
-            f"- Variant: `{item['model_info'].get('selected_variant', '?')}`",
-            f"- Quantization: `{(item['model_info'].get('quantization') or {}).get('name', '?')}`",
+            f"- Variant: `{(item.get('model_info') or {}).get('selected_variant', '?')}`",
+            f"- Quantization: `{((item.get('model_info') or {}).get('quantization') or {}).get('name', '?')}`",
             f"- Runtime: `{item['runtime_minutes']:.1f} min`",
             f"- Prompt tokens: `{item['prompt_tokens']:,}`",
             f"- Completion tokens: `{item['completion_tokens']:,}`",
@@ -1003,7 +1003,7 @@ def html_report(path: Path, report: dict) -> None:
         a = item["aggregate"]
         rows.append(
             "<tr>"
-            f"<td>{html.escape(item['label'])}</td>"
+            f"<td>{html.escape(str(item.get('label') or '?'))}</td>"
             f"<td>{item['runtime_minutes']:.1f} min</td>"
             f"<td>{pct(a['weighted_coverage'])}</td>"
             f"<td>{pct(a['coverage']['critical'])}</td>"
@@ -1016,12 +1016,12 @@ def html_report(path: Path, report: dict) -> None:
     detail = []
     for item in report["models"]:
         a = item["aggregate"]
-        detail.append(f"<h2>{html.escape(item['label'])}</h2>")
+        detail.append(f"<h2>{html.escape(str(item.get('label') or '?'))}</h2>")
         detail.append("<h3>Model</h3><ul>")
-        detail.append(f"<li>Name: {html.escape(item['model_info'].get('display_name', item['model']))}</li>")
-        detail.append(f"<li>Key: {html.escape(item['model'])}</li>")
-        detail.append(f"<li>Variant: {html.escape(item['model_info'].get('selected_variant', '?'))}</li>")
-        detail.append(f"<li>Quantization: {html.escape((item['model_info'].get('quantization') or {}).get('name', '?'))}</li>")
+        detail.append(f"<li>Name: {html.escape(str((item.get('model_info') or {}).get('display_name') or item['model']))}</li>")
+        detail.append(f"<li>Key: {html.escape(str(item['model']))}</li>")
+        detail.append(f"<li>Variant: {html.escape(str((item.get('model_info') or {}).get('selected_variant') or '?'))}</li>")
+        detail.append(f"<li>Quantization: {html.escape(str((((item.get('model_info') or {}).get('quantization') or {}).get('name')) or '?'))}</li>")
         detail.append(f"<li>Runtime: {item['runtime_minutes']:.1f} min</li>")
         detail.append(f"<li>Prompt tokens: {item['prompt_tokens']:,}</li>")
         detail.append(f"<li>Completion tokens: {item['completion_tokens']:,}</li>")
@@ -1032,13 +1032,13 @@ def html_report(path: Path, report: dict) -> None:
             detail.append(f"<tr><td>{imp}</td><td>{pct(a['coverage'][imp])}</td><td>{sum(c.values())}</td><td>{c['supported']}</td><td>{c['partial']}</td><td>{c['missing']}</td><td>{c['contradicted']}</td></tr>")
         detail.append("</table>")
         detail.append("<h3>Critical omissions</h3><ul>")
-        detail.extend(f"<li>Chapter {html.escape(str(x['chapter']))}: {html.escape(x['note'])}</li>" for x in a["critical_omissions"])
+        detail.extend(f"<li>Chapter {html.escape(str(x.get('chapter') or '?'))}: {html.escape(str(x.get('note') or ''))}</li>" for x in a["critical_omissions"])
         if not a["critical_omissions"]: detail.append("<li>None detected.</li>")
         detail.append("</ul><h3>Major omissions</h3><ul>")
-        detail.extend(f"<li>Chapter {html.escape(str(x['chapter']))}: {html.escape(x['note'])}</li>" for x in a["major_omissions"])
+        detail.extend(f"<li>Chapter {html.escape(str(x.get('chapter') or '?'))}: {html.escape(str(x.get('note') or ''))}</li>" for x in a["major_omissions"])
         if not a["major_omissions"]: detail.append("<li>None detected.</li>")
         detail.append("</ul><h3>Unsupported claims</h3><ul>")
-        detail.extend(f"<li>Chapter {html.escape(str(x['chapter']))}: {html.escape(x.get('claim', ''))} — {html.escape(x.get('note', ''))}</li>" for x in a["unsupported_claims"][:50])
+        detail.extend(f"<li>Chapter {html.escape(str(x.get('chapter') or '?'))}: {html.escape(str(x.get('claim') or ''))} — {html.escape(str(x.get('note') or ''))}</li>" for x in a["unsupported_claims"][:50])
         if not a["unsupported_claims"]: detail.append("<li>None detected.</li>")
         detail.append("</ul>")
 
@@ -1046,8 +1046,8 @@ def html_report(path: Path, report: dict) -> None:
 <html><head><meta charset="utf-8"><title>EPUB LLM Summary Evaluation</title>
 <style>body{{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;max-width:1200px;margin:40px auto;padding:0 20px;line-height:1.45}}table{{border-collapse:collapse;width:100%;margin:15px 0 30px}}th,td{{border:1px solid #ccc;padding:7px;text-align:left}}th{{background:#f3f3f3}}code{{background:#f3f3f3;padding:2px 4px}}li{{margin:4px 0}}</style></head>
 <body><h1>EPUB LLM Summary Evaluation</h1>
-<p>Generated: {html.escape(report['generated_at'])}</p><p>Book: <b>{html.escape(report['book_title'])}</b></p>
-<h2>Evaluator</h2><ul><li>{html.escape(report['evaluator']['display_name'])}</li><li>{html.escape(report['evaluator']['model'])}</li><li>Variant: {html.escape(report['evaluator'].get('selected_variant','?'))}</li><li>Context: {report['evaluator']['context']:,}</li><li>Reasoning: {html.escape(report['evaluator']['reasoning'])}</li></ul>
+<p>Generated: {html.escape(str(report.get('generated_at') or ''))}</p><p>Book: <b>{html.escape(str(report.get('book_title') or ''))}</b></p>
+<h2>Evaluator</h2><ul><li>{html.escape(str(report['evaluator'].get('display_name') or report['evaluator'].get('model') or '?'))}</li><li>{html.escape(str(report['evaluator'].get('model') or '?'))}</li><li>Variant: {html.escape(str(report['evaluator'].get('selected_variant') or '?'))}</li><li>Context: {report['evaluator']['context']:,}</li><li>Reasoning: {html.escape(str(report['evaluator'].get('reasoning') or 'off'))}</li></ul>
 <h2>Model comparison</h2><table><tr><th>Model / run</th><th>Runtime</th><th>Weighted coverage</th><th>Critical</th><th>Major</th><th>Unsupported claims</th><th>Critical omissions</th><th>Major omissions</th></tr>{''.join(rows)}</table>
 {''.join(detail)}
 </body></html>"""
@@ -1394,7 +1394,7 @@ def run(args):
 
     for item in model_reports:
         match = next((x for x in book_level if x["run_dir"] == item["run_dir"]), None)
-        item["book_evaluation"] = match["result"] if match else {}
+        item["book_evaluation"] = (match.get("result") if isinstance(match, dict) else None) or {}
 
     report = {
         "generated_at": datetime.now().astimezone().isoformat(),
