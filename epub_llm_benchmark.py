@@ -350,8 +350,19 @@ def get_context_limit(model_info: dict, default: int = 32768) -> int:
             return int(value)
     return default
 
-def chapter_chunks(text: str, context_limit: int, reserved_output_tokens: int, prompt_overhead_tokens: int, overlap_chars: int) -> list[str]:
-    """Send the whole chapter when it fits; otherwise adaptively chunk it."""
+def chapter_chunks(text: str, context_limit: int, reserved_output_tokens: int, prompt_overhead_tokens: int, overlap_chars: int, chunk_size_tokens: int | None = None) -> list[str]:
+    """Split a chapter using an optional explicit input-token chunk size.
+
+    When ``chunk_size_tokens`` is provided, it is the maximum approximate
+    input size of each chunk. Otherwise the existing adaptive context-based
+    behavior is preserved.
+    """
+    if chunk_size_tokens is not None:
+        if chunk_size_tokens <= 0:
+            raise ValueError("chunk_size_tokens must be greater than zero")
+        max_chars = max(4000, int(chunk_size_tokens * 3.5))
+        return split_text(text, max_chars=max_chars, overlap=overlap_chars)
+
     available = context_limit - reserved_output_tokens - prompt_overhead_tokens
     if estimate_tokens(text) <= available:
         return [text]
@@ -555,98 +566,97 @@ def chat(
         content, usage = parse_native(response)
         return content, usage, elapsed
 
-    # First try the native API.
-    content, usage, elapsed = native_call(first_budget)
-    if content:
+    # For reasoning-enabled models, prefer the OpenAI-compatible endpoint.
+    # LM Studio's native endpoint can return a long reasoning block without a
+    # final message for DeepSeek R1, while /v1/chat/completions returns both
+    # reasoning and final content when given the full output budget.
+    #
+    # There is no separate reasoning-token ceiling exposed by this endpoint,
+    # so max_tokens must remain the complete budget for the single inference.
+    def openai_call(budget: int):
+        url = base_url.rstrip("/") + "/v1/chat/completions"
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": temperature,
+            "max_tokens": budget,
+            "stream": False,
+        }
+        started = time.perf_counter()
+        response = api_request(url, payload, timeout)
+        elapsed = time.perf_counter() - started
+        choices = response.get("choices") or []
+        choice = choices[0] if choices else {}
+        message = choice.get("message") or {}
+        content = (message.get("content") or "").strip()
+        reasoning_content = (
+            message.get("reasoning_content")
+            or message.get("reasoning")
+            or ""
+        )
+        openai_usage = response.get("usage") or {}
+        input_tokens = int(openai_usage.get("prompt_tokens", 0) or openai_usage.get("input_tokens", 0) or 0)
+        completion_tokens = int(openai_usage.get("completion_tokens", 0) or openai_usage.get("output_tokens", 0) or 0)
+        details = openai_usage.get("completion_tokens_details") or {}
+        reasoning_tokens = int(details.get("reasoning_tokens", 0) or openai_usage.get("reasoning_tokens", 0) or 0)
+        usage = {
+            "prompt_tokens": input_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": int(openai_usage.get("total_tokens", 0) or (input_tokens + completion_tokens)),
+            "completion_tokens_details": {"reasoning_tokens": reasoning_tokens},
+            "reasoning_tokens": reasoning_tokens,
+            "lmstudio_stats": {**openai_usage, "endpoint": "/v1/chat/completions", "finish_reason": choice.get("finish_reason")},
+            "reasoning_content": reasoning_content,
+        }
         return content, usage, elapsed
 
-    # If native returned reasoning but no final message, try the
-    # OpenAI-compatible endpoint. It exposes reasoning_content separately for
-    # some model families and can parse the final answer correctly.
-    #
-    # We intentionally do not feed the private reasoning text back into the
-    # prompt: the fallback should remain a faithful benchmark of the supplied
-    # source text, not a second-stage benchmark conditioned on hidden analysis.
-    url = base_url.rstrip("/") + "/v1/chat/completions"
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": temperature,
-        "max_tokens": final_answer_budget,
-        "stream": False,
-    }
+    if reasoning != "off":
+        try:
+            content, usage, elapsed = openai_call(total_budget)
+            if content:
+                return content, usage, elapsed
+            openai_error = "OpenAI-compatible endpoint returned an empty final answer."
+        except RuntimeError as e:
+            openai_error = str(e)
 
-    # Do not force a reasoning parameter on the fallback endpoint. This keeps
-    # the fallback compatible with models whose reasoning configuration is not
-    # exposed by the OpenAI-compatible endpoint.
-    started = time.perf_counter()
-    try:
-        response = api_request(url, payload, timeout)
-    except RuntimeError as fallback_error:
+        # Only if the compatible endpoint itself fails do we try the native
+        # endpoint. This is a genuine fallback, not a second full inference.
+        try:
+            content, usage, elapsed = native_call(first_budget)
+            if content:
+                return content, usage, elapsed
+            native_error = "Native endpoint returned an empty final answer."
+        except RuntimeError as e:
+            native_error = str(e)
         raise RuntimeError(
-            "LM Studio returned an empty final answer from the native /api/v1/chat "
-            f"endpoint. Native stats={usage.get('lmstudio_stats', {})}. "
-            "The OpenAI-compatible fallback also failed: "
-            f"{fallback_error}"
-        ) from fallback_error
-    fallback_elapsed = time.perf_counter() - started
-
-    choices = response.get("choices") or []
-    choice = choices[0] if choices else {}
-    message = choice.get("message") or {}
-    content = (message.get("content") or "").strip()
-    reasoning_content = (
-        message.get("reasoning_content")
-        or message.get("reasoning")
-        or ""
-    )
-    openai_usage = response.get("usage") or {}
-    input_tokens = int(
-        openai_usage.get("prompt_tokens", 0)
-        or openai_usage.get("input_tokens", 0)
-        or 0
-    )
-    completion_tokens = int(
-        openai_usage.get("completion_tokens", 0)
-        or openai_usage.get("output_tokens", 0)
-        or 0
-    )
-    details = openai_usage.get("completion_tokens_details") or {}
-    reasoning_tokens = int(
-        details.get("reasoning_tokens", 0)
-        or openai_usage.get("reasoning_tokens", 0)
-        or 0
-    )
-    fallback_usage = {
-        "prompt_tokens": input_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": int(openai_usage.get("total_tokens", 0) or (input_tokens + completion_tokens)),
-        "completion_tokens_details": {
-            "reasoning_tokens": reasoning_tokens,
-        },
-        "reasoning_tokens": reasoning_tokens,
-        "lmstudio_stats": {
-            **openai_usage,
-            "endpoint": "/v1/chat/completions",
-            "finish_reason": choice.get("finish_reason"),
-        },
-        "reasoning_content": reasoning_content,
-        "fallback_from_native": True,
-    }
-
-    if not content:
-        raise RuntimeError(
-            "LM Studio returned an empty final answer from both endpoints. "
-            f"Native stats={usage.get('lmstudio_stats', {})}; "
-            f"OpenAI-compatible usage={openai_usage}; "
-            f"reasoning tokens={reasoning_tokens}."
+            "LM Studio returned no final answer from either endpoint. "
+            f"OpenAI-compatible: {openai_error}; Native: {native_error}"
         )
 
-    # Preserve both requests in the measured elapsed time.
-    return content, fallback_usage, elapsed + fallback_elapsed
+    # Explicit non-reasoning runs retain the native endpoint first.
+    try:
+        content, usage, elapsed = native_call(total_budget)
+        if content:
+            return content, usage, elapsed
+        native_error = "Native endpoint returned an empty final answer."
+    except RuntimeError as e:
+        native_error = str(e)
+
+    try:
+        content, usage, elapsed = openai_call(total_budget)
+        if content:
+            usage["fallback_from_native"] = True
+            return content, usage, elapsed
+        openai_error = "OpenAI-compatible endpoint returned an empty final answer."
+    except RuntimeError as e:
+        openai_error = str(e)
+    raise RuntimeError(
+        "LM Studio returned no final answer from either endpoint. "
+        f"Native: {native_error}; OpenAI-compatible: {openai_error}"
+    )
 
 
 # -----------------------------
@@ -977,7 +987,7 @@ def run(args):
     print(f"Reasoning:  {effective_reasoning} (requested: {args.reasoning})")
     print(f"Reasoning supported: {', '.join(allowed_reasoning) if allowed_reasoning else 'metadata unavailable'}")
     print(f"Context:    {effective_context:,} tokens")
-    print("Chunking:   whole chapter when it fits")
+    print(f"Chunking:   explicit {args.chunk_size:,} input tokens/chunk" if args.chunk_size else "Chunking:   whole chapter when it fits; adaptive fallback otherwise")
     print(f"Output:     {output_dir}")
     print(f"Run ID:     {run_id}")
     print()
@@ -1013,7 +1023,12 @@ def run(args):
                 "max_tokens_book": args.max_tokens_book,
                 "context": effective_context,
                 "loaded_instance": (model_info.get("loaded_instances") or [{}])[0],
-                "chunking": "whole chapter when it fits; adaptive fallback otherwise",
+                "chunking": (
+                    f"explicit {args.chunk_size} input tokens/chunk"
+                    if args.chunk_size
+                    else "whole chapter when it fits; adaptive fallback otherwise"
+                ),
+                "chunk_size_tokens": args.chunk_size,
                 "chunk_overlap": args.chunk_overlap,
                 "chapters": [
                     {
@@ -1063,6 +1078,7 @@ def run(args):
             reserved_output_tokens=chapter_output_budget,
             prompt_overhead_tokens=1000,
             overlap_chars=args.chunk_overlap,
+            chunk_size_tokens=args.chunk_size,
         )
 
         chapter_summary_path = chapter_dir / "chapter_summary.json"
@@ -1409,6 +1425,12 @@ def main():
         type=int,
         default=500,
         help="Character overlap used only when a chapter must be split (default: 500)",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help="Maximum approximate input tokens per chunk. If omitted, use the existing adaptive chunking behavior.",
     )
     parser.add_argument(
         "--max-tokens-chunk",
