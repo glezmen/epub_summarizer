@@ -263,6 +263,7 @@ def cloud_chat_openai(
     temperature: float,
     reasoning: str,
     timeout: int,
+    schema: Optional[dict] = None,
 ) -> tuple[str, dict, float, dict]:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -277,6 +278,8 @@ def cloud_chat_openai(
         "temperature": temperature,
         "reasoning_effort": reasoning_value(reasoning),
     }
+    if schema:
+        payload["response_format"] = json_schema_response_format(schema)
     started = time.perf_counter()
     response = api_request(
         "https://api.openai.com/v1/chat/completions",
@@ -447,6 +450,16 @@ def cloud_chat_anthropic(
     return content, usage, elapsed, info
 
 
+_local_structured_output = True
+
+
+def json_schema_response_format(schema: dict) -> dict:
+    return {
+        "type": "json_schema",
+        "json_schema": {"name": "evaluation", "strict": True, "schema": schema},
+    }
+
+
 def chat(
     provider: str,
     base_url: str,
@@ -457,7 +470,9 @@ def chat(
     temperature: float,
     reasoning: str,
     timeout: int,
+    schema: Optional[dict] = None,
 ) -> tuple[str, dict, float, dict]:
+    global _local_structured_output
     if provider == "local":
         payload = {
             "model": model,
@@ -469,8 +484,24 @@ def chat(
             "max_tokens": max_tokens,
             "reasoning_effort": reasoning_value(reasoning),
         }
+        url = base_url.rstrip("/") + "/v1/chat/completions"
         started = time.perf_counter()
-        response = api_request(base_url.rstrip("/") + "/v1/chat/completions", payload, timeout=timeout)
+        if schema and _local_structured_output:
+            try:
+                response = api_request(
+                    url, {**payload, "response_format": json_schema_response_format(schema)}, timeout=timeout
+                )
+            except RuntimeError as e:
+                if not str(e).startswith("HTTP 4"):
+                    raise
+                # Some LM Studio runtimes reject response_format; fall back to
+                # free-form generation for the rest of the run.
+                _local_structured_output = False
+                print(f"    WARNING: structured output rejected by LM Studio; continuing without it. ({e})")
+                started = time.perf_counter()
+                response = api_request(url, payload, timeout=timeout)
+        else:
+            response = api_request(url, payload, timeout=timeout)
         elapsed = time.perf_counter() - started
         try:
             choice = response["choices"][0]
@@ -487,36 +518,109 @@ def chat(
                 f"completion_tokens={usage.get('completion_tokens', 0)}, "
                 f"reasoning_tokens={details.get('reasoning_tokens', 0)}"
             )
-        return content, usage, elapsed, {"provider": "local"}
+        return content, usage, elapsed, {
+            "provider": "local",
+            "finish_reason": finish_reason,
+        }
     if provider == "openai":
-        return cloud_chat_openai(model, system, user, max_tokens, temperature, reasoning, timeout)
+        return cloud_chat_openai(model, system, user, max_tokens, temperature, reasoning, timeout, schema)
     if provider == "anthropic":
         return cloud_chat_anthropic(model, system, user, max_tokens, temperature, reasoning, timeout)
     if provider == "claude-code":
         return cloud_chat_claude_code(model, system, user, max_tokens, temperature, reasoning, timeout)
     raise RuntimeError(f"Unsupported evaluator provider: {provider}")
 
+class JSONExtractionError(RuntimeError):
+    """Raised when no valid JSON can be recovered from a response."""
+
+
+def escape_inner_quotes(text: str) -> str:
+    """Escape double quotes that appear inside JSON strings without escaping.
+
+    A quote inside a string is treated as the closing quote only when it is
+    followed (after optional whitespace) by a JSON structural character.
+    Fixes responses such as: "note": "the "blood bar" is introduced"
+    """
+    out = []
+    in_string = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if not in_string:
+            if ch == '"':
+                in_string = True
+            out.append(ch)
+        elif ch == "\\":
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        elif ch == '"':
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j >= n or text[j] in ",}]:":
+                in_string = False
+                out.append(ch)
+            else:
+                out.append('\\"')
+        elif ch == "\n":
+            out.append("\\n")
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def extract_json(text: str) -> Any:
-    """Parse JSON from a response, tolerating markdown fences or surrounding prose."""
+    """Parse JSON from a response, tolerating markdown fences, surrounding
+    prose and unescaped double quotes inside string values."""
     cleaned = text.strip()
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\s*```$", "", cleaned)
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-    candidates = []
+    candidates = [cleaned]
     for opener, closer in [("{", "}"), ("[", "]")]:
         start = cleaned.find(opener)
         end = cleaned.rfind(closer)
         if start >= 0 and end > start:
             candidates.append(cleaned[start:end + 1])
+
+    first_error: Optional[json.JSONDecodeError] = None
     for candidate in candidates:
         try:
             return json.loads(candidate)
+        except json.JSONDecodeError as e:
+            first_error = first_error or e
+    for candidate in candidates[1:] or candidates:
+        try:
+            return json.loads(escape_inner_quotes(candidate))
         except json.JSONDecodeError:
             continue
-    raise RuntimeError("Evaluator response did not contain valid JSON.")
+
+    detail = ""
+    if first_error is not None:
+        doc = first_error.doc
+        context = doc[max(0, first_error.pos - 60):first_error.pos + 60].replace("\n", "\\n")
+        detail = (
+            f" {first_error.msg} at line {first_error.lineno}, column {first_error.colno}"
+            f" near: ...{context}..."
+        )
+    raise JSONExtractionError("Evaluator response did not contain valid JSON." + detail)
+
+
+JSON_REPAIR_PROMPT = """The JSON below is syntactically invalid and could not be parsed.
+
+PARSE ERROR:
+{error}
+
+Return the same content as corrected, valid JSON only. Keep every item and status.
+- Escape or replace any double quote inside string values (use single quotes for quotations).
+- Shorten any note longer than two sentences to its final conclusion; if the note's conclusion disagrees with its status, set the status to match the conclusion.
+- Do not add commentary or markdown fences.
+
+INVALID JSON:
+{raw}
+"""
 
 
 def chat_json_with_retry(
@@ -525,31 +629,116 @@ def chat_json_with_retry(
     model: str,
     system: str,
     user: str,
-    budget: int,
+    initial_budget: int,
     max_budget: int,
     temperature: float,
     reasoning: str,
     timeout: int,
+    label: str = "Evaluator",
+    context_length: int = 0,
+    schema: Optional[dict] = None,
+    max_repair_attempts: int = 2,
 ) -> tuple[Any, dict, float, dict]:
-    """Run an evaluator request and retry once with the full JSON budget if parsing fails.
+    """Generate valid JSON.
 
-    This protects long fact/claim evaluations from being cut off at a dynamically
-    calculated output limit. The first request keeps the adaptive budget; the retry
-    uses the configured maximum.
+    max_budget <= 0 means automatic: use the remaining model context.
+    finish_reason=length: the output was truncated, so retry with a doubled budget.
+    Any other finish_reason: the output is complete but malformed. Re-running the
+    same prompt (often at temperature 0) reproduces the same error, so instead the
+    malformed response is sent back with the parse error and fixed in a repair call.
     """
-    raw, usage, elapsed, meta = chat(
-        provider, base_url, model, system, user, budget, temperature, reasoning, timeout
-    )
-    try:
-        return extract_json(raw), usage, elapsed, meta
-    except RuntimeError:
-        if max_budget <= budget:
-            raise
-        print(f"      JSON response incomplete/invalid; retrying with max output {max_budget} tokens")
-        raw2, usage2, elapsed2, meta2 = chat(
-            provider, base_url, model, system, user, max_budget, temperature, reasoning, timeout
+    prompt_tokens = estimate_tokens(system + "\n\n" + user)
+    safety_margin = 1024
+
+    if context_length and context_length > prompt_tokens + safety_margin:
+        context_budget = context_length - prompt_tokens - safety_margin
+    else:
+        context_budget = 0
+
+    if max_budget > 0:
+        effective_max = min(max_budget, context_budget) if context_budget else max_budget
+    else:
+        effective_max = context_budget
+
+    if effective_max <= 0:
+        raise RuntimeError(
+            f"{label}: no usable output context remains "
+            f"(prompt ~{prompt_tokens:,} tokens, context={context_length:,})."
         )
-        return extract_json(raw2), usage2, elapsed + elapsed2, meta2
+
+    budget = min(max(1, initial_budget), effective_max)
+    total_elapsed = 0.0
+    total_usage = {}
+    repairs = 0
+    attempt = 0
+    request_user = user
+    request_temperature = temperature
+
+    def debug_dump(raw: str, finish_reason: str, exc: Exception) -> None:
+        print()
+        print("=" * 80)
+        print(f"DEBUG: {label} invalid JSON response")
+        print(f"  attempt:        {attempt}")
+        print(f"  output budget:  {budget:,}")
+        print(f"  finish_reason:  {finish_reason}")
+        print(f"  parse error:    {exc}")
+        print("-" * 80)
+        print("RAW EVALUATOR RESPONSE:")
+        print(raw)
+        print("=" * 80)
+        print()
+
+    while True:
+        attempt += 1
+        raw, usage, elapsed, info = chat(
+            provider, base_url, model, system, request_user,
+            budget, request_temperature, reasoning, timeout, schema
+        )
+        total_elapsed += elapsed
+        for k, v in (usage or {}).items():
+            if isinstance(v, (int, float)):
+                total_usage[k] = total_usage.get(k, 0) + int(v)
+
+        try:
+            parsed = extract_json(raw)
+            if attempt > 1:
+                print(f"    {label}: JSON succeeded on attempt {attempt} ({budget:,} output-token budget)")
+            return parsed, total_usage, total_elapsed, info
+        except JSONExtractionError as exc:
+            finish_reason = (info or {}).get("finish_reason") or "unknown"
+            debug_dump(raw, finish_reason, exc)
+
+            if finish_reason == "length":
+                if budget >= effective_max:
+                    raise RuntimeError(
+                        f"{label}: JSON truncated at the maximum output budget of {budget:,} tokens."
+                    ) from exc
+                next_budget = min(effective_max, max(budget * 2, 4096))
+                print(
+                    f"    {label}: JSON truncated at {budget:,} output tokens; "
+                    f"retrying with {next_budget:,}..."
+                )
+                budget = next_budget
+                request_user = user
+                request_temperature = temperature
+                continue
+
+            if repairs >= max_repair_attempts:
+                raise RuntimeError(
+                    f"{label}: evaluator response did not contain valid JSON after "
+                    f"{repairs} repair attempt(s) (finish_reason={finish_reason}). "
+                    f"Last error: {exc}"
+                ) from exc
+            repairs += 1
+            print(
+                f"    {label}: JSON malformed (finish_reason={finish_reason}); "
+                f"requesting repair {repairs}/{max_repair_attempts}..."
+            )
+            # The repair prompt contains the previous answer instead of the
+            # source text, so it needs roughly the same output budget.
+            request_user = render_prompt(JSON_REPAIR_PROMPT, error=str(exc), raw=raw)
+            request_temperature = max(temperature, 0.2)
+            budget = min(effective_max, max(budget, estimate_tokens(raw) + 1024))
 
 
 def estimate_tokens(text: str) -> int:
@@ -658,8 +847,63 @@ SYSTEM = (
     "You are a rigorous factual benchmark evaluator. "
     "Use the supplied source text as the final authority. "
     "The NotebookLM reference is useful for identifying important events, "
-    "but it can be imperfect. Do not invent facts. Return valid JSON only."
+    "but it can be imperfect. Do not invent facts. Return valid JSON only. "
+    "Inside JSON string values never use unescaped double quotes; "
+    "use single quotes when quoting text."
 )
+
+IMPORTANCE_ENUM = ["critical", "major", "moderate", "minor"]
+
+
+def _object_schema(properties: dict) -> dict:
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
+
+def _array_of(item_schema: dict) -> dict:
+    return {"type": "array", "items": item_schema}
+
+
+FACT_SCHEMA = _object_schema({
+    "facts": _array_of(_object_schema({
+        "id": {"type": "string"},
+        "fact": {"type": "string"},
+        "importance": {"type": "string", "enum": IMPORTANCE_ENUM},
+        "type": {"type": "string", "enum": [
+            "event", "character", "discovery", "decision",
+            "consequence", "relationship", "setting", "other",
+        ]},
+    })),
+})
+
+EVAL_SCHEMA = _object_schema({
+    "fact_results": _array_of(_object_schema({
+        "fact_id": {"type": "string"},
+        "status": {"type": "string", "enum": ["supported", "partial", "missing", "contradicted"]},
+        "importance": {"type": "string", "enum": IMPORTANCE_ENUM},
+        "note": {"type": "string"},
+    })),
+    "model_claims": _array_of(_object_schema({
+        "claim": {"type": "string"},
+        "status": {"type": "string", "enum": ["supported", "partial", "unsupported", "contradicted"]},
+        "importance": {"type": "string", "enum": IMPORTANCE_ENUM},
+        "note": {"type": "string"},
+    })),
+})
+
+BOOK_EVAL_SCHEMA = _object_schema({
+    **{key: {"type": "number"} for key in [
+        "critical_coverage", "major_coverage", "moderate_coverage",
+        "minor_coverage", "weighted_coverage", "story_arc_coverage",
+    ]},
+    **{key: _array_of({"type": "string"}) for key in [
+        "major_omissions", "critical_omissions", "unsupported_claims", "contradictions",
+    ]},
+})
 
 FACT_PROMPT = """Create an importance-tagged reference fact set for this chapter.
 
@@ -733,6 +977,8 @@ Rules:
 - Do not penalize the model for omitting minor facts.
 - Do not reward verbosity by itself.
 - Pay special attention to causal relationships, character attribution, chronology, and consequences.
+- Decide each status before writing it. Every note must be at most two sentences stating the final verdict's evidence; do not write deliberation, self-corrections or re-evaluations inside notes.
+- When quoting the summary or the EPUB inside a note, use single quotes, never double quotes.
 
 BOOK: {book_title}
 SOURCE LANGUAGE: {book_language}
@@ -1367,8 +1613,11 @@ def run(args):
             source=chapter.text,
         )
         budget = min(args.max_tokens_facts, max(args.min_output_tokens, dynamic_budget(prompt, args.max_tokens_facts, args.min_output_tokens)))
-        raw, usage, elapsed, _ = chat(args.evaluator, args.base_url, evaluator_model, SYSTEM, prompt, budget, args.temperature, args.reasoning, args.timeout)
-        parsed = extract_json(raw)
+        parsed, usage, elapsed, _ = chat_json_with_retry(
+            args.evaluator, args.base_url, evaluator_model, SYSTEM, prompt,
+            budget, args.max_tokens_facts, args.temperature, args.reasoning, args.timeout,
+            label="Fact extraction", context_length=evaluator_context, schema=FACT_SCHEMA
+        )
         facts = parsed.get("facts", []) if isinstance(parsed, dict) else []
         # Ensure stable IDs even if evaluator omitted/duplicated IDs.
         normalized = []
@@ -1458,10 +1707,14 @@ def run(args):
                 summary=summary,
                 source=chapter.text,
             )
-            budget = min(args.max_tokens_eval, max(args.min_output_tokens, dynamic_budget(prompt, args.max_tokens_eval, args.min_output_tokens)))
+            budget_cap = args.max_tokens_eval if args.max_tokens_eval > 0 else 16384
+            budget = max(args.min_output_tokens, dynamic_budget(
+                prompt, budget_cap, args.min_output_tokens
+            ))
             parsed, usage, elapsed, _ = chat_json_with_retry(
                 args.evaluator, args.base_url, evaluator_model, SYSTEM, prompt,
-                budget, args.max_tokens_eval, args.temperature, args.reasoning, args.timeout
+                budget, args.max_tokens_eval, args.temperature, args.reasoning, args.timeout,
+                context_length=evaluator_context, schema=EVAL_SCHEMA
             )
             result = {
                 "chapter": chapter.number,
@@ -1525,10 +1778,14 @@ def run(args):
             facts=facts_text,
             summary=summary,
         )
-        budget = min(args.max_tokens_book_eval, max(args.min_output_tokens, dynamic_budget(prompt, args.max_tokens_book_eval, args.min_output_tokens)))
+        budget_cap = args.max_tokens_book_eval if args.max_tokens_book_eval > 0 else 16384
+        budget = max(args.min_output_tokens, dynamic_budget(
+            prompt, budget_cap, args.min_output_tokens
+        ))
         parsed, usage, elapsed, _ = chat_json_with_retry(
             args.evaluator, args.base_url, evaluator_model, SYSTEM, prompt,
-            budget, args.max_tokens_book_eval, args.temperature, args.reasoning, args.timeout
+            budget, args.max_tokens_book_eval, args.temperature, args.reasoning, args.timeout,
+            context_length=evaluator_context, schema=BOOK_EVAL_SCHEMA
         )
         result = {
             "model": item["model"],
@@ -1603,8 +1860,8 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0, help="Evaluator temperature (default: 0.0)")
     parser.add_argument("--reasoning", choices=["off", "low", "medium", "high", "xhigh", "on"], default="off")
     parser.add_argument("--max-tokens-facts", type=int, default=4096, help="Max tokens per chapter reference-fact extraction")
-    parser.add_argument("--max-tokens-eval", type=int, default=4096, help="Max tokens per chapter evaluation")
-    parser.add_argument("--max-tokens-book-eval", type=int, default=4096, help="Max tokens for complete-book evaluation")
+    parser.add_argument("--max-tokens-eval", type=int, default=0, help="Max tokens per chapter evaluation")
+    parser.add_argument("--max-tokens-book-eval", type=int, default=0, help="Max tokens for complete-book evaluation")
     parser.add_argument("--min-output-tokens", type=int, default=2048)
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument(
