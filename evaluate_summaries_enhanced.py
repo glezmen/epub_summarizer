@@ -917,7 +917,7 @@ main{max-width:1500px;margin:0 auto;padding:24px}.top{position:sticky;top:0;z-in
 h1{margin:0 0 4px;font-size:26px}h2{margin:28px 0 12px}h3{margin:18px 0 8px}.muted{color:var(--muted)}
 .grid{display:grid;gap:12px}.cards{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin:16px 0}.card,.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;box-shadow:0 1px 2px #00000008}.card b{display:block;font-size:23px}.card span{color:var(--muted);font-size:12px}
 .controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px;align-items:end}.control label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}.control input{width:100%;padding:6px 8px;border:1px solid #cbd2d8;border-radius:6px;background:white}.control button{padding:7px 10px;border:1px solid #cbd2d8;border-radius:6px;background:white;cursor:pointer}.control button:hover{background:#f0f2f4}
-.charts{grid-template-columns:1fr 1fr}.chart{min-height:260px;overflow:visible}.scatter{width:100%;height:300px;display:block}.legend{display:flex;flex-wrap:wrap;gap:12px 18px;margin:8px 0 14px}.legend-item{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)}.swatch{width:12px;height:12px;border-radius:3px;display:inline-block;border:1px solid #00000018}.barrow{display:grid;grid-template-columns:minmax(140px,1fr) 3fr 55px;gap:8px;align-items:center;margin:9px 0}.bar{height:18px;background:#edf0f2;border-radius:4px;overflow:hidden}.fill{height:100%;background:var(--accent)}.fill.good{background:var(--good)}
+.charts{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:start}.charts-left{display:flex;flex-direction:column;gap:12px;min-width:0}.charts>.charts-coverage{min-width:0;min-height:0}.charts .panel{min-width:0;min-height:0}.chart{min-height:0;overflow:visible}.charts-coverage #importanceChart{max-height:none}@media(max-width:800px){.charts{grid-template-columns:1fr}.charts-left{gap:12px}.charts>.charts-coverage{width:100%}}.scatter{width:100%;height:300px;display:block}.legend{display:flex;flex-wrap:wrap;gap:12px 18px;margin:8px 0 14px}.legend-item{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)}.swatch{width:12px;height:12px;border-radius:3px;display:inline-block;border:1px solid #00000018}.barrow{display:grid;grid-template-columns:minmax(140px,1fr) 3fr 55px;gap:8px;align-items:center;margin:9px 0}.bar{height:18px;background:#edf0f2;border-radius:4px;overflow:hidden}.fill{height:100%;background:var(--accent)}.fill.good{background:var(--good)}
 .stack{display:flex;height:24px;border-radius:4px;overflow:hidden;background:#eee}.stack span{height:100%;min-width:1px}.supported{background:#48a868}.partial{background:#d4a72c}.missing{background:#cbd1d6}.contradicted{background:#d9534f}
 .sort{cursor:pointer;user-select:none;white-space:nowrap}.sort:after{content:" ↕";color:#9aa1a8}.sort.asc:after{content:" ↑"}.sort.desc:after{content:" ↓"}
 table{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%;background:white;table-layout:auto}th,td{border-bottom:1px solid var(--line);padding:8px;text-align:left;vertical-align:top}th{background:#f0f3f6;z-index:2;white-space:nowrap}th:first-child,td:first-child{min-width:220px}td{white-space:nowrap}.tablewrap{overflow-x:auto;overflow-y:visible;max-width:100%;-webkit-overflow-scrolling:touch}td.num,th.num{text-align:right}tr:hover td{background:#fafbfc}th.tip{position:relative;cursor:help}th.tip::after{content:"ⓘ";display:inline-block;margin-left:5px;font-size:11px;font-weight:600;color:#68737d;vertical-align:1px}.table-tooltip{position:fixed;z-index:9999;max-width:330px;padding:9px 11px;border-radius:7px;background:#17202a;color:#fff;font-size:12px;line-height:1.4;box-shadow:0 4px 14px rgba(0,0,0,.2);pointer-events:none;white-space:normal}
@@ -952,10 +952,12 @@ table{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%
 
 <div class="cards grid" id="cards"></div>
 
-<section class="charts grid">
+<section class="charts">
+<div class="charts-left">
 <div class="panel chart"><h2>Adjusted score</h2><div id="scoreChart"></div></div>
-<div class="panel chart"><h2>Coverage by importance</h2><div id="importanceLegend" class="legend"></div><div id="importanceChart"></div></div>
 <div class="panel chart"><h2>Runtime vs. weighted coverage</h2><div id="runtimeCoverageChart"></div></div>
+</div>
+<div class="panel chart charts-coverage"><h2>Coverage by importance</h2><div id="importanceLegend" class="legend"></div><div id="importanceChart"></div></div>
 </section>
 
 <section class="panel">
