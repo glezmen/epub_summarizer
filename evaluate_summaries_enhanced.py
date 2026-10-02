@@ -1404,7 +1404,7 @@ def run(args):
             "label": label,
             "run_dir": str(run_dir),
             "model": model_key,
-            "model_info": book_info.get("model_info", {}),
+            "model_info": book_info.get("model_info") or {},
             "runtime_seconds": float(run_stats.get("total_elapsed_seconds", 0) or 0),
             "runtime_minutes": float(run_stats.get("total_elapsed_seconds", 0) or 0) / 60,
             "prompt_tokens": int(run_stats.get("total_prompt_tokens", 0) or 0),
@@ -1457,8 +1457,10 @@ def run(args):
         save_json(eval_root / safe_name(Path(item["run_dir"]).parent.name) / Path(item["run_dir"]).name / "book_evaluation.json", result)
 
     for item in model_reports:
-        match = next((x for x in book_level if x["run_dir"] == item["run_dir"]), None)
-        item["book_evaluation"] = match["result"] if match else {}
+        match = next((x for x in book_level if x.get("run_dir") == item["run_dir"]), None)
+        item["book_evaluation"] = (match.get("result") or {}) if isinstance(match, dict) else {}
+        item["model_info"] = item.get("model_info") or {}
+        item["aggregate"] = item.get("aggregate") or {}
 
     report = {
         "generated_at": datetime.now().astimezone().isoformat(),
