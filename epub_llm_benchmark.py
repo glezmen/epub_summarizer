@@ -555,6 +555,11 @@ def chat(
         input_tokens = int(stats.get("input_tokens", 0) or 0)
         completion_tokens = int(stats.get("total_output_tokens", 0) or 0)
         reasoning_tokens = int(stats.get("reasoning_output_tokens", 0) or 0)
+        finish_reason = (
+            response.get("finish_reason")
+            or response.get("stop_reason")
+            or stats.get("finish_reason")
+        )
         usage = {
             "prompt_tokens": input_tokens,
             "completion_tokens": completion_tokens,
@@ -563,6 +568,7 @@ def chat(
                 "reasoning_tokens": reasoning_tokens,
             },
             "reasoning_tokens": reasoning_tokens,
+            "finish_reason": finish_reason,
             "lmstudio_stats": stats,
             "reasoning_content": reasoning_content,
         }
@@ -629,6 +635,7 @@ def chat(
             "total_tokens": int(openai_usage.get("total_tokens", 0) or (input_tokens + completion_tokens)),
             "completion_tokens_details": {"reasoning_tokens": reasoning_tokens},
             "reasoning_tokens": reasoning_tokens,
+            "finish_reason": choice.get("finish_reason"),
             "lmstudio_stats": {**openai_usage, "endpoint": "/v1/chat/completions", "finish_reason": choice.get("finish_reason")},
             "reasoning_content": reasoning_content,
         }
@@ -740,7 +747,10 @@ CHUNK SUMMARIES:
 BOOK_DIGEST_PROMPT = """We are preparing a compact intermediate digest of a novel for a later whole-book summary.
 
 Book: {book_title}
-Language: {summary_language}
+Source language: {book_language}
+REQUIRED OUTPUT LANGUAGE: {summary_language}
+
+IMPORTANT LANGUAGE RULE: Every word of the digest must be written in {summary_language}. Do not write the digest in English. Do not translate the supplied chapter summaries into English.
 
 Below are chapter summaries. Compress them into a concise, factually faithful digest.
 Preserve important plot events, characters, relationships, causes/effects, discoveries, conflicts, and the ending information present in the summaries.
@@ -757,6 +767,8 @@ Source language: {book_language}
 Summary language: {summary_language}
 
 Below are factual summaries of every chapter, in chronological order.
+
+MANDATORY LANGUAGE RULE: Write the ENTIRE answer in {summary_language}. This is a hard requirement. Do not answer in English unless {summary_language} is English. Do not translate the supplied material to English.
 
 Create a coherent, detailed summary of the COMPLETE PLOT.
 
@@ -830,6 +842,57 @@ def format_duration(seconds: float) -> str:
     if minutes:
         return f"{minutes}m {secs:02d}s"
     return f"{secs}s"
+
+
+def looks_like_incomplete_summary(text: str, usage: dict, requested_budget: int) -> bool:
+    """Detect a book summary that appears to have been cut off mid-generation.
+
+    finish_reason=length is authoritative when LM Studio reports it.  Some
+    native LM Studio responses do not expose finish_reason, so also detect the
+    common failure mode where the generated text ends on an unfinished
+    sentence.  The latter is deliberately conservative: a normal final
+    sentence ending in punctuation is considered complete.
+    """
+    text = (text or "").strip()
+    if not text:
+        return True
+
+    finish_reason = usage.get("finish_reason")
+    if finish_reason in {"length", "max_tokens", "max_output_tokens", "token_limit"}:
+        return True
+
+    # If the model used almost the entire requested budget and the final
+    # character is ordinary prose rather than sentence-closing punctuation,
+    # this is very likely a hard output-limit truncation.
+    completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+    near_limit = requested_budget > 0 and completion_tokens >= int(requested_budget * 0.80)
+    if not near_limit:
+        return False
+
+    tail = text[-500:].rstrip()
+    if not tail:
+        return True
+    return tail[-1] not in ".!?…:;”’)]}"
+
+
+def build_book_continuation_prompt(book_prompt: str, partial_summary: str) -> str:
+    return f"""Continue the complete-book summary below.
+
+IMPORTANT:
+- The text below is already generated and must NOT be repeated.
+- Continue directly from its exact endpoint.
+- Preserve the same language, factual style and chronological order.
+- Use ONLY the supplied chapter summaries from the original task.
+- Finish the remaining plot and end with a complete final sentence.
+
+ORIGINAL BOOK-SUMMARY TASK:
+{book_prompt}
+
+ALREADY GENERATED SUMMARY:
+{partial_summary}
+
+CONTINUE FROM EXACTLY HERE. Do not add a heading or preamble; output only the continuation.
+"""
 
 
 def save_json(path: Path, obj) -> None:
@@ -1055,6 +1118,7 @@ def run(args):
                 "max_tokens_chunk": args.max_tokens_chunk,
                 "max_tokens_merge": args.max_tokens_merge,
                 "max_tokens_book": args.max_tokens_book,
+                "max_book_summary_passes": args.max_book_summary_passes,
                 "context": effective_context,
                 "loaded_instance": (model_info.get("loaded_instances") or [{}])[0],
                 "chunking": (
@@ -1301,21 +1365,19 @@ def run(args):
         )
         completed_chapters_elapsed += time.perf_counter() - chapter_started
 
-    # Final whole-book summary.
+    # Final whole-book summary: always use hierarchical synthesis.
     book_summary_path = output_dir / "book_summary.json"
     cached_book_summary = None
-
     if book_summary_path.exists() and (output_dir / "book_summary.md").exists():
         try:
             record = load_json(book_summary_path)
-            if (
-                record.get("book_title") == book_title
-                and record.get("model") == model
-                and str(record.get("summary", "")).strip()
-            ):
+            if (record.get("book_title") == book_title
+                    and record.get("model") == model
+                    and record.get("complete") is True
+                    and str(record.get("summary", "")).strip()):
                 cached_book_summary = record
         except (OSError, ValueError, TypeError):
-            cached_book_summary = None
+            pass
 
     if cached_book_summary is not None:
         final_summary = str(cached_book_summary["summary"]).strip()
@@ -1323,212 +1385,101 @@ def run(args):
         final_elapsed = float(cached_book_summary.get("elapsed_seconds", 0.0) or 0.0)
         print("\nComplete-book summary: [CACHED]")
         p, c, r = usage_totals(final_usage)
-        total_prompt_tokens += p
-        total_completion_tokens += c
-        total_reasoning_tokens += r
+        total_prompt_tokens += p; total_completion_tokens += c; total_reasoning_tokens += r
         total_elapsed += final_elapsed
     else:
-        print("\nGenerating complete-book summary...")
-
-        raw_book_summaries = "\n\n".join(all_chapter_summaries)
-        book_prompt = BOOK_PROMPT.format(
-            book_title=book_title,
-            book_language=book_language or "metadata unavailable",
-            summary_language=summary_language,
-            summaries=raw_book_summaries,
-        )
-
-        book_output_budget = choose_output_tokens(
-            book_prompt,
-            cap=args.max_tokens_book,
-            minimum=(
-                args.reasoning_min_output_tokens
-                if effective_reasoning != "off"
-                else args.min_output_tokens
-            ),
-            ratio=(
-                args.reasoning_output_ratio
-                if effective_reasoning != "off"
-                else args.output_ratio
-            ),
-        )
-
-        # estimate_tokens() is intentionally conservative enough for chapter
-        # decisions, but the book prompt contains model-generated summaries
-        # whose tokenizer density can be very different (especially in
-        # Hungarian). If the prompt is too large, recursively compact the
-        # chapter summaries until the final prompt fits the context.
-        book_input_tokens = estimate_tokens(book_prompt)
-        context_for_book = effective_context
-        minimum_book_output = 256
+        print("\nGenerating complete-book summary (hierarchical)...")
+        book_context = effective_context
         safety_margin = 1024
-        max_safe_input = max(1000, context_for_book - minimum_book_output - safety_margin)
+        group_target = max(1500, min(7000, (book_context - safety_margin) // 5))
 
-        if book_input_tokens > max_safe_input:
-            print(
-                f"Book summary input is too large for the {context_for_book:,}-token context "
-                f"(~{book_input_tokens:,} estimated tokens); compacting chapter summaries..."
-            )
+        def make_groups(items):
+            groups, cur, cur_tokens = [], [], 0
+            for item in items:
+                n = estimate_tokens(item)
+                if cur and cur_tokens + n > group_target:
+                    groups.append(cur); cur=[]; cur_tokens=0
+                cur.append(item); cur_tokens += n
+            if cur: groups.append(cur)
+            return groups
 
-            # Start with the per-chapter summaries and repeatedly compact them.
-            # A single compaction pass is not necessarily sufficient: e.g. 76
-            # chapter summaries can become ~12K tokens after the first pass,
-            # which still does not fit into an 8K context. Each subsequent pass
-            # therefore compacts the previous digests again until the final
-            # BOOK_PROMPT fits safely.
-            current_items = list(all_chapter_summaries)
-            pass_no = 0
-            digest_budget = min(1024, max(512, context_for_book // 8))
-
-            while True:
-                candidate_prompt = BOOK_PROMPT.format(
+        def digest_level(items, level):
+            groups = make_groups(items)
+            print(f"Digest level {level}: {len(items)} items -> {len(groups)} groups")
+            out=[]
+            for i, group in enumerate(groups, 1):
+                prompt = BOOK_DIGEST_PROMPT.format(
                     book_title=book_title,
                     book_language=book_language or "metadata unavailable",
                     summary_language=summary_language,
-                    summaries="\n\n".join(
-                        f"--- Intermediate digest {i} ---\n{digest}"
-                        for i, digest in enumerate(current_items, 1)
-                    ),
-                )
-                candidate_tokens = estimate_tokens(candidate_prompt)
-                if candidate_tokens <= max_safe_input:
-                    book_prompt = candidate_prompt
-                    book_input_tokens = candidate_tokens
-                    break
+                    summaries="\n\n".join(group))
+                inp=estimate_tokens(prompt)
+                # For hierarchical synthesis, do not impose an arbitrary digest
+                # output cap. Let the model generate as much as it needs, limited
+                # only by the remaining context window.
+                budget = max(256, book_context - inp - safety_margin)
+                print(f"  Digest {i}/{len(groups)}: ~{inp:,} input, {budget:,} output")
+                digest, usage, elapsed = chat(
+                    args.base_url, model, prompt, budget, args.temperature, args.timeout,
+                    effective_reasoning, send_reasoning, args.reasoning_max_tokens, args.final_answer_tokens)
+                if not digest.strip():
+                    raise RuntimeError(f"Digest level {level} item {i} returned no final answer.")
+                out.append(digest.strip())
+                total_stats[0] += int(usage.get("prompt_tokens", 0) or 0)
+                total_stats[1] += int(usage.get("completion_tokens", 0) or 0)
+                total_stats[2] += int(usage.get("reasoning_tokens", 0) or 0)
+                total_stats[3] += elapsed
+            return out
 
-                pass_no += 1
-                # Keep each digest request comfortably below the context limit.
-                # Smaller batches produce a stronger reduction and avoid making
-                # the digest request itself hit the context limit.
-                batch_limit = max(1200, (context_for_book - 2048) // 2)
-                batches: list[str] = []
-                current_batch: list[str] = []
-                current_tokens = 0
-                for item in current_items:
-                    item_tokens = estimate_tokens(item)
-                    if current_batch and current_tokens + item_tokens > batch_limit:
-                        batches.append("\n\n".join(current_batch))
-                        current_batch = []
-                        current_tokens = 0
-                    current_batch.append(item)
-                    current_tokens += item_tokens
-                if current_batch:
-                    batches.append("\n\n".join(current_batch))
+        # [prompt_tokens, completion_tokens, reasoning_tokens, elapsed_seconds]
+        total_stats = [0, 0, 0, 0.0]
+        current = list(all_chapter_summaries)
+        level = 1
+        while True:
+            candidate = BOOK_PROMPT.format(
+                book_title=book_title, book_language=book_language or "metadata unavailable",
+                summary_language=summary_language, summaries="\n\n".join(current))
+            candidate_tokens = estimate_tokens(candidate)
+            if candidate_tokens <= book_context - safety_margin - 2048 and len(current) <= 8:
+                break
+            before=len(current)
+            current=digest_level(current, level)
+            if len(current) >= before:
+                raise RuntimeError(f"Hierarchical compaction did not reduce items ({before} -> {len(current)}).")
+            level += 1
 
-                compacted: list[str] = []
-                print(
-                    f"Compaction pass {pass_no}: {len(current_items)} items -> "
-                    f"{len(batches)} digest batch(es)"
-                )
-                for i, batch in enumerate(batches, 1):
-                    digest_prompt = BOOK_DIGEST_PROMPT.format(
-                        book_title=book_title,
-                        summary_language=summary_language,
-                        summaries=batch,
-                    )
-                    actual_digest_budget = fit_output_budget_to_context(
-                        estimate_tokens(digest_prompt),
-                        digest_budget,
-                        context_for_book,
-                        safety_margin=512,
-                    )
-                    print(
-                        f"  Digest pass {pass_no} batch {i}/{len(batches)}: "
-                        f"~{estimate_tokens(digest_prompt):,} input, "
-                        f"{actual_digest_budget:,} output"
-                    )
-                    digest, digest_usage, digest_elapsed = chat(
-                        args.base_url,
-                        model,
-                        digest_prompt,
-                        actual_digest_budget,
-                        args.temperature,
-                        args.timeout,
-                        effective_reasoning,
-                        send_reasoning,
-                        args.reasoning_max_tokens,
-                        args.final_answer_tokens,
-                    )
-                    if not digest.strip():
-                        raise RuntimeError(
-                            f"Book digest pass {pass_no}, batch {i} returned no final answer."
-                        )
-                    compacted.append(digest.strip())
-                    total_elapsed += digest_elapsed
-                    p_tokens, c_tokens, r_tokens = usage_totals(digest_usage)
-                    total_prompt_tokens += p_tokens
-                    total_completion_tokens += c_tokens
-                    total_reasoning_tokens += r_tokens
-
-                # If compaction somehow does not reduce the number of items,
-                # fail explicitly rather than looping forever.
-                if len(compacted) >= len(current_items):
-                    raise RuntimeError(
-                        "Book-summary compaction did not reduce the prompt enough "
-                        f"(still {candidate_tokens:,} estimated input tokens)."
-                    )
-                current_items = compacted
-
-            print(f"Compacted book summary input: ~{book_input_tokens:,} tokens")
-
-        requested_book_output_budget = book_output_budget
-        book_output_budget = fit_output_budget_to_context(
-            book_input_tokens,
-            requested_book_output_budget,
-            context_for_book,
-            safety_margin=1024,
-        )
-        if book_output_budget != requested_book_output_budget:
-            print(
-                f"Book summary input: ~{book_input_tokens:,} tokens, "
-                f"output budget: {book_output_budget:,} "
-                f"(requested {requested_book_output_budget:,}; "
-                f"context {context_for_book:,})"
-            )
-        else:
-            print(
-                f"Book summary input: ~{book_input_tokens:,} tokens, "
-                f"output budget: {book_output_budget:,}"
-            )
-
-        final_summary, final_usage, final_elapsed = chat(
-            args.base_url,
-            model,
-            book_prompt,
-            book_output_budget,
-            args.temperature,
-            args.timeout,
-            effective_reasoning,
-            send_reasoning,
-            args.reasoning_max_tokens,
-            args.final_answer_tokens,
-        )
-
+        total_prompt_tokens += total_stats[0]
+        total_completion_tokens += total_stats[1]
+        total_reasoning_tokens += total_stats[2]
+        total_elapsed += total_stats[3]
+        final_prompt=BOOK_PROMPT.format(
+            book_title=book_title, book_language=book_language or "metadata unavailable",
+            summary_language=summary_language,
+            summaries="\n\n".join(f"--- Story digest {i} ---\n{x}" for i,x in enumerate(current,1)))
+        final_in=estimate_tokens(final_prompt)
+        # No fixed final-summary token cap: the only hard limit is the model
+        # context window after accounting for the prompt and safety margin.
+        final_budget = max(256, book_context - final_in - safety_margin)
+        print(f"Final book synthesis: ~{final_in:,} input, {final_budget:,} output")
+        final_summary, final_usage, final_elapsed=chat(
+            args.base_url, model, final_prompt, final_budget, args.temperature, args.timeout,
+            effective_reasoning, send_reasoning, args.reasoning_max_tokens, args.final_answer_tokens)
+        if not final_summary.strip():
+            raise RuntimeError("Final hierarchical book summary returned no final answer.")
+        completion=int(final_usage.get("completion_tokens",0) or 0)
+        likely_truncated=(completion >= int(final_budget*0.98) and
+                          not re.search(r"[.!?…»”\"]\s*$", final_summary.strip()))
+        if likely_truncated:
+            raise RuntimeError(f"Final hierarchical book summary appears truncated at {final_budget:,} tokens.")
         total_elapsed += final_elapsed
-        p, c, r = usage_totals(final_usage)
-        total_prompt_tokens += p
-        total_completion_tokens += c
-        total_reasoning_tokens += r
-
-        (output_dir / "book_summary.md").write_text(
-            f"# {book_title}\n\n"
-            f"## Complete plot summary\n\n"
-            f"{final_summary}\n",
-            encoding="utf-8",
-        )
-
-        save_json(
-            book_summary_path,
-            {
-                "book_title": book_title,
-                "model": model,
-                "model_dir": model_dir_name,
-                "run_id": run_id,
-                "summary": final_summary,
-                "elapsed_seconds": final_elapsed,
-                "usage": final_usage,
-            },
-        )
+        p,c,r=usage_totals(final_usage)
+        total_prompt_tokens += p; total_completion_tokens += c; total_reasoning_tokens += r
+        (output_dir / "book_summary.md").write_text(f"# {book_title}\n\n## Complete plot summary\n\n{final_summary}\n", encoding="utf-8")
+        save_json(book_summary_path, {
+            "book_title": book_title, "model": model, "model_dir": model_dir_name,
+            "run_id": run_id, "summary": final_summary, "complete": True,
+            "generation_method": "hierarchical", "generation_passes": level + 1,
+            "elapsed_seconds": final_elapsed, "usage": final_usage})
 
     save_json(
         output_dir / "run_stats.json",
@@ -1616,8 +1567,14 @@ def main():
     parser.add_argument(
         "--max-tokens-book",
         type=int,
-        default=8192,
-        help="Maximum generated tokens for the complete-book summary (dynamic budget is chosen up to this cap)",
+        default=None,
+        help="Deprecated: ignored for hierarchical whole-book synthesis; output is limited only by the model context window.",
+    )
+    parser.add_argument(
+        "--max-book-summary-passes",
+        type=int,
+        default=3,
+        help="Maximum total generation passes for the complete-book summary when the output appears truncated (default: 3)",
     )
     parser.add_argument(
         "--min-output-tokens",
