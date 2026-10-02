@@ -343,27 +343,6 @@ def choose_output_tokens(text: str, cap: int, minimum: int = 2048, ratio: float 
     recommended = ((recommended + 511) // 512) * 512
     return max(minimum, min(cap, recommended))
 
-def fit_output_budget_to_context(
-    input_tokens: int,
-    requested_output_tokens: int,
-    context_tokens: int,
-    safety_margin: int = 256,
-) -> int:
-    """Reduce an output budget so input + output stays within model context.
-
-    The dynamic budget minimum is intentionally allowed to shrink here: for a
-    near-context-limit prompt, preserving a valid request is more important
-    than enforcing the normal minimum output budget.
-    """
-    available = context_tokens - input_tokens - safety_margin
-    if available < 256:
-        raise ValueError(
-            f"Prompt is too large for the model context: input={input_tokens:,}, "
-            f"context={context_tokens:,}, safety_margin={safety_margin:,}."
-        )
-    return min(requested_output_tokens, available)
-
-
 def get_context_limit(model_info: dict, default: int = 32768) -> int:
     for key in ("context_length", "contextLength", "context"):
         value = model_info.get(key)
@@ -734,19 +713,6 @@ Requirements:
 Write the summary in {summary_language}. Do not translate it to another language unless that is the selected summary language.
 
 CHUNK SUMMARIES:
-{summaries}
-"""
-
-BOOK_DIGEST_PROMPT = """We are preparing a compact intermediate digest of a novel for a later whole-book summary.
-
-Book: {book_title}
-Language: {summary_language}
-
-Below are chapter summaries. Compress them into a concise, factually faithful digest.
-Preserve important plot events, characters, relationships, causes/effects, discoveries, conflicts, and the ending information present in the summaries.
-Do not invent information and do not add commentary about the summarization process.
-
-CHAPTER SUMMARIES:
 {summaries}
 """
 
@@ -1330,12 +1296,11 @@ def run(args):
     else:
         print("\nGenerating complete-book summary...")
 
-        raw_book_summaries = "\n\n".join(all_chapter_summaries)
         book_prompt = BOOK_PROMPT.format(
             book_title=book_title,
             book_language=book_language or "metadata unavailable",
             summary_language=summary_language,
-            summaries=raw_book_summaries,
+            summaries="\n\n".join(all_chapter_summaries),
         )
 
         book_output_budget = choose_output_tokens(
@@ -1352,120 +1317,10 @@ def run(args):
                 else args.output_ratio
             ),
         )
-
-        # estimate_tokens() is intentionally conservative enough for chapter
-        # decisions, but the book prompt contains model-generated summaries
-        # whose tokenizer density can be very different (especially in
-        # Hungarian). If the estimated prompt is close to the context limit,
-        # first compress the chapter summaries in deterministic batches. This
-        # avoids LM Studio rejecting the request because the real tokenizer
-        # count is higher than our character-based estimate.
-        book_input_tokens = estimate_tokens(book_prompt)
-        context_for_book = effective_context
-        # Character-based token estimates can significantly underestimate
-        # LM Studio's actual tokenizer count, especially for generated
-        # Hungarian summaries. Keep a generous reserve for tokenizer
-        # overhead and API prompt formatting. For the book-level request we
-        # therefore compact before the prompt gets anywhere near the raw
-        # context limit.
-        book_context_safety_margin = 1024
-        requested_book_output_budget = book_output_budget
-        max_safe_input = max(1000, context_for_book - requested_book_output_budget - book_context_safety_margin)
-
-        if book_input_tokens > max_safe_input:
-            print(
-                f"Book summary input is too large for the {context_for_book:,}-token context "
-                f"(~{book_input_tokens:,} estimated tokens); compacting chapter summaries..."
-            )
-
-            # Build deterministic batches by estimated token size. Keep each
-            # digest request well below half the context so its output also has
-            # ample room.
-            batch_limit = max(1200, (context_for_book - 2048) // 2)
-            batches: list[str] = []
-            current: list[str] = []
-            current_tokens = 0
-            for chapter_summary in all_chapter_summaries:
-                chapter_tokens = estimate_tokens(chapter_summary)
-                if current and current_tokens + chapter_tokens > batch_limit:
-                    batches.append("\n\n".join(current))
-                    current = []
-                    current_tokens = 0
-                current.append(chapter_summary)
-                current_tokens += chapter_tokens
-            if current:
-                batches.append("\n\n".join(current))
-
-            compacted: list[str] = []
-            for i, batch in enumerate(batches, 1):
-                digest_prompt = BOOK_DIGEST_PROMPT.format(
-                    book_title=book_title,
-                    summary_language=summary_language,
-                    summaries=batch,
-                )
-                digest_budget = min(1024, max(512, context_for_book // 8))
-                digest_budget = fit_output_budget_to_context(
-                    estimate_tokens(digest_prompt),
-                    digest_budget,
-                    context_for_book,
-                    safety_margin=512,
-                )
-                print(
-                    f"  Digest batch {i}/{len(batches)}: "
-                    f"~{estimate_tokens(digest_prompt):,} input, "
-                    f"{digest_budget:,} output"
-                )
-                digest, digest_usage, digest_elapsed = chat(
-                    args.base_url,
-                    model,
-                    digest_prompt,
-                    digest_budget,
-                    args.temperature,
-                    args.timeout,
-                    effective_reasoning,
-                    send_reasoning,
-                    args.reasoning_max_tokens,
-                    args.final_answer_tokens,
-                )
-                if not digest.strip():
-                    raise RuntimeError(f"Book digest batch {i} returned no final answer.")
-                compacted.append(digest.strip())
-                total_elapsed += digest_elapsed
-                p_tokens, c_tokens, r_tokens = usage_totals(digest_usage)
-                total_prompt_tokens += p_tokens
-                total_completion_tokens += c_tokens
-                total_reasoning_tokens += r_tokens
-
-            book_prompt = BOOK_PROMPT.format(
-                book_title=book_title,
-                book_language=book_language or "metadata unavailable",
-                summary_language=summary_language,
-                summaries="\n\n".join(
-                    f"--- Intermediate digest {i} ---\n{digest}"
-                    for i, digest in enumerate(compacted, 1)
-                ),
-            )
-            book_input_tokens = estimate_tokens(book_prompt)
-            print(f"Compacted book summary input: ~{book_input_tokens:,} tokens")
-
-        book_output_budget = fit_output_budget_to_context(
-            book_input_tokens,
-            book_output_budget,
-            context_for_book,
-            safety_margin=book_context_safety_margin,
+        print(
+            f"Book summary input: ~{estimate_tokens(book_prompt):,} tokens, "
+            f"output budget: {book_output_budget:,}"
         )
-        if book_output_budget != requested_book_output_budget:
-            print(
-                f"Book summary input: ~{book_input_tokens:,} tokens, "
-                f"output budget: {book_output_budget:,} "
-                f"(requested {requested_book_output_budget:,}; "
-                f"context {context_for_book:,})"
-            )
-        else:
-            print(
-                f"Book summary input: ~{book_input_tokens:,} tokens, "
-                f"output budget: {book_output_budget:,}"
-            )
 
         final_summary, final_usage, final_elapsed = chat(
             args.base_url,
