@@ -808,15 +808,6 @@ def aggregate_chapter_evaluation(results: list[dict]) -> dict:
     }
 
 
-def _safe_dict(value):
-    return value if isinstance(value, dict) else {}
-
-def _safe_get(obj, key, default=None):
-    d = _safe_dict(obj)
-    value = d.get(key)
-    return default if value is None else value
-
-
 def markdown_report(path: Path, report: dict) -> None:
     lines = [
         f"# EPUB LLM Summary Evaluation",
@@ -828,22 +819,21 @@ def markdown_report(path: Path, report: dict) -> None:
         "",
         f"- Model: `{report['evaluator']['display_name']}`",
         f"- Model key: `{report['evaluator']['model']}`",
-        f"- Variant: `{_safe_get(report.get('evaluator'), 'selected_variant', '?')}`",
-        f"- Quantization: `{_safe_get(_safe_get(report['evaluator'], 'quantization', {}), 'name', '?')}`",
+        f"- Variant: `{report['evaluator'].get('selected_variant', '?')}`",
+        f"- Quantization: `{report['evaluator'].get('quantization', {}).get('name', '?')}`",
         f"- Context: `{report['evaluator']['context']:,}` tokens",
         f"- Temperature: `{report['evaluator']['temperature']}`",
         f"- Reasoning: `{report['evaluator']['reasoning']}`",
         "",
         "## Model comparison",
         "",
-        "| Model / run | Runtime | Story arc | Weighted coverage | Critical | Major | Unsupported claims | Critical omissions | Major omissions |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Model / run | Runtime | Weighted coverage | Critical | Major | Unsupported claims | Critical omissions | Major omissions |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for item in report["models"]:
         a = item["aggregate"]
         lines.append(
             f"| `{item['label']}` | {item['runtime_minutes']:.1f} min | "
-            f"{pct(item.get('book_evaluation', {}).get('story_arc_coverage', 0))} | "
             f"{pct(a['weighted_coverage'])} | {pct(a['coverage']['critical'])} | "
             f"{pct(a['coverage']['major'])} | {a['claims']['unsupported']} | "
             f"{len(a['critical_omissions'])} | {len(a['major_omissions'])} |"
@@ -855,10 +845,10 @@ def markdown_report(path: Path, report: dict) -> None:
         lines += [
             f"### {item['label']}",
             "",
-            f"- Model: `{_safe_get(item.get('model_info'), 'display_name', item['model'])}`",
+            f"- Model: `{item['model_info'].get('display_name', item['model'])}`",
             f"- Model key: `{item['model']}`",
-            f"- Variant: `{_safe_get(item.get('model_info'), 'selected_variant', '?')}`",
-            f"- Quantization: `{_safe_get(_safe_get(item.get('model_info'), 'quantization', {}), 'name', '?')}`",
+            f"- Variant: `{item['model_info'].get('selected_variant', '?')}`",
+            f"- Quantization: `{(item['model_info'].get('quantization') or {}).get('name', '?')}`",
             f"- Runtime: `{item['runtime_minutes']:.1f} min`",
             f"- Prompt tokens: `{item['prompt_tokens']:,}`",
             f"- Completion tokens: `{item['completion_tokens']:,}`",
@@ -917,10 +907,10 @@ main{max-width:1500px;margin:0 auto;padding:24px}.top{position:sticky;top:0;z-in
 h1{margin:0 0 4px;font-size:26px}h2{margin:28px 0 12px}h3{margin:18px 0 8px}.muted{color:var(--muted)}
 .grid{display:grid;gap:12px}.cards{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin:16px 0}.card,.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;box-shadow:0 1px 2px #00000008}.card b{display:block;font-size:23px}.card span{color:var(--muted);font-size:12px}
 .controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px;align-items:end}.control label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}.control input{width:100%;padding:6px 8px;border:1px solid #cbd2d8;border-radius:6px;background:white}.control button{padding:7px 10px;border:1px solid #cbd2d8;border-radius:6px;background:white;cursor:pointer}.control button:hover{background:#f0f2f4}
-.charts{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:start}.charts-left{display:flex;flex-direction:column;gap:12px;min-width:0}.charts>.charts-coverage{min-width:0;min-height:0}.charts .panel{min-width:0;min-height:0}.chart{min-height:0;overflow:visible}.charts-coverage #importanceChart{max-height:none}@media(max-width:800px){.charts{grid-template-columns:1fr}.charts-left{gap:12px}.charts>.charts-coverage{width:100%}}.scatter{width:100%;height:300px;display:block}.legend{display:flex;flex-wrap:wrap;gap:12px 18px;margin:8px 0 14px}.legend-item{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)}.swatch{width:12px;height:12px;border-radius:3px;display:inline-block;border:1px solid #00000018}.barrow{display:grid;grid-template-columns:minmax(140px,1fr) 3fr 55px;gap:8px;align-items:center;margin:9px 0}.bar{height:18px;background:#edf0f2;border-radius:4px;overflow:hidden}.fill{height:100%;background:var(--accent)}.fill.good{background:var(--good)}
+.charts{grid-template-columns:1fr 1fr}.chart{min-height:260px}.barrow{display:grid;grid-template-columns:minmax(140px,1fr) 3fr 55px;gap:8px;align-items:center;margin:9px 0}.bar{height:18px;background:#edf0f2;border-radius:4px;overflow:hidden}.fill{height:100%;background:var(--accent)}.fill.good{background:var(--good)}
 .stack{display:flex;height:24px;border-radius:4px;overflow:hidden;background:#eee}.stack span{height:100%;min-width:1px}.supported{background:#48a868}.partial{background:#d4a72c}.missing{background:#cbd1d6}.contradicted{background:#d9534f}
-.sort{cursor:pointer;user-select:none;white-space:nowrap}.sort:after{content:" ↕";color:#9aa1a8}.sort.asc:after{content:" ↑"}.sort.desc:after{content:" ↓"}
-table{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%;background:white;table-layout:auto}th,td{border-bottom:1px solid var(--line);padding:8px;text-align:left;vertical-align:top}th{background:#f0f3f6;z-index:2;white-space:nowrap}th:first-child,td:first-child{min-width:220px}td{white-space:nowrap}.tablewrap{overflow-x:auto;overflow-y:visible;max-width:100%;-webkit-overflow-scrolling:touch}td.num,th.num{text-align:right}tr:hover td{background:#fafbfc}th.tip{position:relative;cursor:help}th.tip::after{content:"ⓘ";display:inline-block;margin-left:5px;font-size:11px;font-weight:600;color:#68737d;vertical-align:1px}.table-tooltip{position:fixed;z-index:9999;max-width:330px;padding:9px 11px;border-radius:7px;background:#17202a;color:#fff;font-size:12px;line-height:1.4;box-shadow:0 4px 14px rgba(0,0,0,.2);pointer-events:none;white-space:normal}
+.tablewrap{overflow:auto}.sort{cursor:pointer;user-select:none;white-space:nowrap}.sort:after{content:" ↕";color:#9aa1a8}.sort.asc:after{content:" ↑"}.sort.desc:after{content:" ↓"}
+table{border-collapse:collapse;width:100%;background:white}th,td{border-bottom:1px solid var(--line);padding:8px;text-align:left;vertical-align:top}th{position:sticky;top:76px;background:#f0f3f6;z-index:2}td.num,th.num{text-align:right}tr:hover td{background:#fafbfc}
 .pill{display:inline-block;border-radius:999px;padding:2px 7px;font-size:12px;background:#edf0f2}.score{font-weight:700}.details{margin-top:12px}.details>summary{cursor:pointer;font-weight:700;padding:10px;background:#fff;border:1px solid var(--line);border-radius:8px}.details[open]>summary{border-radius:8px 8px 0 0}
 .detailbody{background:#fff;border:1px solid var(--line);border-top:0;padding:12px}.subdetails{margin:8px 0}.subdetails summary{cursor:pointer;font-weight:600}.issue{padding:7px 0;border-bottom:1px solid #eef0f2}.issue small{color:var(--muted)}
 .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted)}.dot{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px}
@@ -952,12 +942,9 @@ table{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%
 
 <div class="cards grid" id="cards"></div>
 
-<section class="charts">
-<div class="charts-left">
+<section class="charts grid">
 <div class="panel chart"><h2>Adjusted score</h2><div id="scoreChart"></div></div>
-<div class="panel chart"><h2>Runtime vs. weighted coverage</h2><div id="runtimeCoverageChart"></div></div>
-</div>
-<div class="panel chart charts-coverage"><h2>Coverage by importance</h2><div id="importanceLegend" class="legend"></div><div id="importanceChart"></div></div>
+<div class="panel chart"><h2>Coverage by importance</h2><div id="importanceChart"></div></div>
 </section>
 
 <section class="panel">
@@ -995,12 +982,10 @@ function resetWeights(){for(const [k,v] of Object.entries(defaults)){const id={c
 function label(m){return m.model_info?.display_name||m.model||m.label}
 function renderCards(){
  const avg=models.reduce((s,m)=>s+metrics(m).adjusted,0)/Math.max(1,models.length);
- const avgStoryArc=models.reduce((s,m)=>s+(m.book_evaluation?.story_arc_coverage||0),0)/Math.max(1,models.length);
  const best=models.reduce((b,m)=>!b||metrics(m).adjusted>metrics(b).adjusted?m:b,null);
  const totalFacts=models.length?Object.values(models[0].aggregate.fact_counts).reduce((s,x)=>s+Object.values(x).reduce((a,b)=>a+b,0),0):0;
  document.getElementById("cards").innerHTML=[
  `<div class="card"><b>${models.length}</b><span>models included</span></div>`,
- `<div class="card"><b>${pct(avgStoryArc)}</b><span>average story arc coverage</span></div>`,
  `<div class="card"><b>${pct(avg)}</b><span>average adjusted score</span></div>`,
  `<div class="card"><b>${pct(best?metrics(best).adjusted:0)}</b><span>highest adjusted score</span></div>`,
  `<div class="card"><b>${totalFacts}</b><span>reference facts / model</span></div>`,
@@ -1012,101 +997,26 @@ function renderScoreChart(){
  document.getElementById("scoreChart").innerHTML=arr.map(m=>{const x=metrics(m);return `<div class="barrow"><span>${esc(label(m))}</span><div class="bar"><div class="fill good" style="width:${x.adjusted*100}%"></div></div><b>${pct(x.adjusted)}</b></div>`}).join("");
 }
 function renderImportance(){
- const colors={
-   supported:["supported","Fully supported / covered"],
-   partial:["partial","Partially supported"],
-   missing:["missing","Missing / omitted"],
-   contradicted:["contradicted","Contradicted"]
- };
- document.getElementById("importanceLegend").innerHTML=Object.entries(colors).map(([k,[cls,title]])=>
-   `<span class="legend-item" title="${title}"><span class="swatch ${cls}"></span>${title}</span>`).join("");
  document.getElementById("importanceChart").innerHTML=models.map(m=>{
    const a=m.aggregate,c=a.fact_counts;
-   const parts=["critical","major","moderate","minor"].map(imp=>{
-     const x=c[imp], total=x.supported+x.partial+x.missing+x.contradicted||1;
-     const seg=(key)=>`<span class="${colors[key][0]}" title="${colors[key][1]} — ${imp}: ${x[key]} / ${total} (${(100*x[key]/total).toFixed(1)}%)" style="width:${100*x[key]/total}%"></span>`;
-     return `<div style="margin:10px 0"><div><b>${imp}</b> <span class="muted">${pct(a.coverage[imp])}</span></div><div class="stack">${seg("supported")}${seg("partial")}${seg("missing")}${seg("contradicted")}</div></div>`;
-   }).join("");
-   return `<div><b>${esc(label(m))}</b>${parts}</div>`;
- }).join("");
-}
-function renderRuntimeCoverage(){
- const el=document.getElementById("runtimeCoverageChart");
- if(!models.length){el.innerHTML="";return}
- const W=900,H=320,PL=64,PR=28,PT=24,PB=62;
- const rawMaxX=Math.max(...models.map(m=>Number(m.runtime_minutes)||0),1);
- // Round the X-axis ceiling up so the last point has room and the axis gets useful ticks.
- const step=rawMaxX<=30?5:rawMaxX<=60?10:20;
- const maxX=Math.max(step,Math.ceil(rawMaxX/step)*step);
- const maxY=1;
- const x=v=>PL+(v/maxX)*(W-PL-PR);
- const y=v=>H-PB-v/maxY*(H-PT-PB);
-
- const yGrid=[0,.25,.5,.75,1].map(v=>
-   `<line x1="${PL}" y1="${y(v)}" x2="${W-PR}" y2="${y(v)}" stroke="#dfe3e7"/>`+
-   `<text x="${PL-8}" y="${y(v)+4}" text-anchor="end" font-size="11" fill="#68737d">${(v*100).toFixed(0)}%</text>`
- ).join("");
-
- const xTicks=[];
- for(let v=0; v<=maxX; v+=step){
-   const xx=x(v);
-   xTicks.push(
-     `<line x1="${xx}" y1="${H-PB}" x2="${xx}" y2="${H-PB+5}" stroke="#9aa1a8"/>`+
-     `<text x="${xx}" y="${H-PB+20}" text-anchor="middle" font-size="11" fill="#68737d">${v}</text>`
-   );
- }
- const xTickMarkup=xTicks.join("");
-
- const dots=models.map(m=>{
-   const x0=x(Number(m.runtime_minutes)||0), y0=y(m.aggregate.weighted_coverage||0);
-   const rightSide=x0>W-PR-150;
-   const labelX=rightSide ? W-PR-5 : Math.min(x0+9,W-PR-5);
-   const anchor=rightSide ? "end" : "start";
-   return `<g>`+
-     `<circle cx="${x0}" cy="${y0}" r="6" fill="var(--accent)" stroke="white" stroke-width="2">`+
-     `<title>${esc(label(m))} — ${mins(m.runtime_minutes)} — ${pct(m.aggregate.weighted_coverage)}</title>`+
-     `</circle>`+
-     `<text x="${labelX}" y="${y0+4}" text-anchor="${anchor}" font-size="10" fill="#17202a">${esc(label(m))}</text>`+
-     `</g>`;
- }).join("");
-
- el.innerHTML=`<svg class="scatter" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" style="overflow:visible" role="img" aria-label="Runtime versus weighted coverage">`+
-   `${yGrid}${xTickMarkup}`+
-   `<line x1="${PL}" y1="${H-PB}" x2="${W-PR}" y2="${H-PB}" stroke="#9aa1a8"/>`+
-   `<line x1="${PL}" y1="${PT}" x2="${PL}" y2="${H-PB}" stroke="#9aa1a8"/>`+
-   `<text x="${W/2}" y="${H-12}" text-anchor="middle" font-size="12" fill="#68737d">Runtime (minutes)</text>`+
-   `<text x="15" y="${H/2}" transform="rotate(-90 15 ${H/2})" text-anchor="middle" font-size="12" fill="#68737d">Weighted coverage</text>`+
-   `${dots}</svg>`;
+   const total=Object.values(c).reduce((s,x)=>s+Object.values(x).reduce((u,v)=>u+v,0),0);
+   const parts=["critical","major","moderate","minor"].map(imp=>`<div style="margin:10px 0"><div><b>${imp}</b> <span class="muted">${pct(a.coverage[imp])}</span></div><div class="stack">`+
+    `<span class="supported" style="width:${100*c[imp].supported/(Object.values(c[imp]).reduce((s,v)=>s+v,0)||1)}%"></span>`+
+    `<span class="partial" style="width:${100*c[imp].partial/(Object.values(c[imp]).reduce((s,v)=>s+v,0)||1)}%"></span>`+
+    `<span class="missing" style="width:${100*c[imp].missing/(Object.values(c[imp]).reduce((s,v)=>s+v,0)||1)}%"></span>`+
+    `<span class="contradicted" style="width:${100*c[imp].contradicted/(Object.values(c[imp]).reduce((s,v)=>s+v,0)||1)}%"></span></div></div>`).join("");
+   return `<div><b>${esc(label(m))}</b>${parts}</div>`}).join("");
 }
 const columns=[
- ["model","Model","Model/run being compared."],["adjusted","Adjusted","Base weighted coverage after subtracting the omission, contradiction, and unsupported-claim penalties. The penalties use the current controls above."],["storyArc","Story arc","Evaluator's book-level assessment of how well the summary represents the broader story arcs, major turning points, consequences, and overall story."],["base","Base weighted","Weighted factual coverage before penalties. Fact importance weights and the partial-credit setting are applied, but omission/contradiction/unsupported-claim penalties are not."],["runtime","Runtime","Time required to generate the model's summary, in minutes."],["critical","Critical","Coverage of reference facts classified as critical. Supported facts count fully; partial facts receive the configured partial-credit value."],["major","Major","Coverage of reference facts classified as major."],["moderate","Moderate","Coverage of reference facts classified as moderate."],["minor","Minor","Coverage of reference facts classified as minor."],["contradicted","Contradictions","Number of model claims judged contradicted by the reference/source."],["unsupported","Unsupported","Number of model claims judged unsupported by the reference/source."],["criticalO","Critical omissions","Number of critical reference facts omitted or not adequately covered."],["majorO","Major omissions","Number of major reference facts omitted or not adequately covered."]
+ ["model","Model"],["adjusted","Adjusted"],["base","Base weighted"],["runtime","Runtime"],["critical","Critical"],["major","Major"],["moderate","Moderate"],["minor","Minor"],["contradicted","Contradictions"],["unsupported","Unsupported"],["criticalO","Critical omissions"],["majorO","Major omissions"]
 ];
 let sortKey="adjusted",sortDir=-1;
 function renderHead(){
- document.getElementById("head").innerHTML=columns.map(([k,n,tip])=>`<th class="${k!=="model"?"num ":""}tip sort ${sortKey===k?(sortDir>0?"asc":"desc"):""}" data-tip="${esc(tip)}" onclick="sortBy('${k}')">${n}</th>`).join("");
- document.querySelectorAll("#head th.tip").forEach(th=>{
-   th.addEventListener("mouseenter",()=>showTableTip(th));
-   th.addEventListener("mouseleave",hideTableTip);
-   th.addEventListener("focus",()=>showTableTip(th));
-   th.addEventListener("blur",hideTableTip);
- });
+ document.getElementById("head").innerHTML=columns.map(([k,n])=>`<th class="${k!=="model"?"num":""} sort ${sortKey===k?(sortDir>0?"asc":"desc"):""}" onclick="sortBy('${k}')">${n}</th>`).join("");
 }
-let tableTipEl=null;
-function showTableTip(th){
- if(tableTipEl)tableTipEl.remove();
- tableTipEl=document.createElement("div"); tableTipEl.className="table-tooltip"; tableTipEl.textContent=th.dataset.tip||"";
- document.body.appendChild(tableTipEl);
- const r=th.getBoundingClientRect(), pad=8;
- let left=Math.max(pad,Math.min(r.left,r.right-330));
- let top=r.bottom+8;
- const h=tableTipEl.offsetHeight;
- if(top+h>window.innerHeight-pad)top=Math.max(pad,r.top-h-8);
- tableTipEl.style.left=left+"px"; tableTipEl.style.top=top+"px";
-}
-function hideTableTip(){if(tableTipEl){tableTipEl.remove();tableTipEl=null;}}
 function rowValue(m,k){
  const a=m.aggregate,x=metrics(m);
- return {model:label(m),adjusted:x.adjusted,storyArc:m.book_evaluation?.story_arc_coverage||0,base:x.base,runtime:m.runtime_minutes||0,critical:a.coverage.critical||0,major:a.coverage.major||0,moderate:a.coverage.moderate||0,minor:a.coverage.minor||0,contradicted:a.claims?.contradicted||0,unsupported:a.claims?.unsupported||0,criticalO:a.critical_omissions?.length||0,majorO:a.major_omissions?.length||0}[k];
+ return {model:label(m),adjusted:x.adjusted,base:x.base,runtime:m.runtime_minutes||0,critical:a.coverage.critical||0,major:a.coverage.major||0,moderate:a.coverage.moderate||0,minor:a.coverage.minor||0,contradicted:a.claims?.contradicted||0,unsupported:a.claims?.unsupported||0,criticalO:a.critical_omissions?.length||0,majorO:a.major_omissions?.length||0}[k];
 }
 function renderTable(){
  const q=(document.getElementById("modelSearch").value||"").toLowerCase();
@@ -1114,7 +1024,7 @@ function renderTable(){
  arr.sort((a,b)=>{let x=rowValue(a,sortKey),y=rowValue(b,sortKey);if(typeof x==="string")return sortDir*x.localeCompare(y);return sortDir*(x-y)});
  document.getElementById("tbody").innerHTML=arr.map(m=>{const a=m.aggregate,x=metrics(m);return `<tr>
  <td><b>${esc(label(m))}</b><br><span class="muted">${esc(m.label)}</span></td>
- <td class="num score">${pct(x.adjusted)}</td><td class="num score">${pct(m.book_evaluation?.story_arc_coverage||0)}</td><td class="num">${pct(x.base)}</td><td class="num">${mins(m.runtime_minutes)}</td>
+ <td class="num score">${pct(x.adjusted)}</td><td class="num">${pct(x.base)}</td><td class="num">${mins(m.runtime_minutes)}</td>
  <td class="num">${pct(a.coverage.critical)}</td><td class="num">${pct(a.coverage.major)}</td><td class="num">${pct(a.coverage.moderate)}</td><td class="num">${pct(a.coverage.minor)}</td>
  <td class="num">${a.claims?.contradicted||0}</td><td class="num">${a.claims?.unsupported||0}</td><td class="num">${a.critical_omissions?.length||0}</td><td class="num">${a.major_omissions?.length||0}</td>
  </tr>`}).join("");
@@ -1127,10 +1037,10 @@ function issueList(arr,limit=100){
 function renderDetails(){
  document.getElementById("details").innerHTML=models.map((m,i)=>{const a=m.aggregate,x=metrics(m),mi=m.model_info||{},b=m.book_evaluation||{};
  const counts=a.fact_counts;
- return `<details class="details"><summary>${esc(label(m))} — <span class="score">${pct(b.story_arc_coverage)}</span> story arc / <span class="score">${pct(x.base)}</span> weighted / <span class="score">${pct(x.adjusted)}</span> adjusted · ${mins(m.runtime_minutes)}</summary>
+ return `<details class="details"><summary>${esc(label(m))} — <span class="score">${pct(x.adjusted)}</span> adjusted / ${pct(x.base)} base · ${mins(m.runtime_minutes)}</summary>
  <div class="detailbody">
  <div class="grid cards" style="margin:0 0 10px;grid-template-columns:repeat(auto-fit,minmax(120px,1fr))">
- <div class="card"><b>${pct(b.story_arc_coverage)}</b><span>story arc coverage</span></div><div class="card"><b>${pct(x.base)}</b><span>base weighted</span></div><div class="card"><b>${pct(x.adjusted)}</b><span>adjusted</span></div>
+ <div class="card"><b>${pct(x.base)}</b><span>base weighted</span></div><div class="card"><b>${pct(x.adjusted)}</b><span>adjusted</span></div>
  <div class="card"><b>${a.claims?.contradicted||0}</b><span>contradictions</span></div><div class="card"><b>${a.claims?.unsupported||0}</b><span>unsupported claims</span></div>
  </div>
  <p><b>Model:</b> ${esc(mi.display_name||m.model)} · <b>Key:</b> ${esc(m.model)} · <b>Variant:</b> ${esc(mi.selected_variant||"?")} · <b>Quantization:</b> ${esc(mi.quantization?.name||"?")} · <b>Runtime:</b> ${mins(m.runtime_minutes)} · <b>Prompt:</b> ${(m.prompt_tokens||0).toLocaleString()} · <b>Completion:</b> ${(m.completion_tokens||0).toLocaleString()}</p>
@@ -1149,7 +1059,7 @@ function renderDetails(){
  </details>
  </div></details>`}).join("");
 }
-function render(){renderCards();renderScoreChart();renderImportance();renderRuntimeCoverage();renderHead();renderTable();renderDetails()}
+function render(){renderCards();renderScoreChart();renderImportance();renderHead();renderTable();renderDetails()}
 document.querySelectorAll(".control input").forEach(x=>x.addEventListener("input",render));
 document.getElementById("modelSearch").addEventListener("input",renderTable);
 document.getElementById("subtitle").textContent=`${REPORT.book_title} · generated ${REPORT.generated_at} · evaluator ${REPORT.evaluator?.display_name||REPORT.evaluator?.model||"?"}`;
@@ -1289,9 +1199,42 @@ def run(args):
             reference=reference_section,
             source=chapter.text,
         )
-        budget = min(args.max_tokens_facts, max(args.min_output_tokens, dynamic_budget(prompt, args.max_tokens_facts, args.min_output_tokens)))
-        raw, usage, elapsed, _ = chat(args.evaluator, args.base_url, evaluator_model, SYSTEM, prompt, budget, args.temperature, args.reasoning, args.timeout)
-        parsed = extract_json(raw)
+        # Fact extraction is JSON-heavy and can legitimately require several
+        # thousand output tokens for dense chapters. The generic dynamic
+        # budget used elsewhere has a 2048-token floor, which is too small for
+        # some reference chapters and can cause the model to be cut off in the
+        # middle of a JSON object. Prefer the configured facts cap here and
+        # retry once with the full cap if the first response is not valid JSON.
+        budget = min(
+            args.max_tokens_facts,
+            max(
+                args.min_output_tokens,
+                dynamic_budget(prompt, args.max_tokens_facts, args.min_output_tokens),
+                4096 if args.max_tokens_facts >= 4096 else args.max_tokens_facts,
+            ),
+        )
+        raw, usage, elapsed, _ = chat(
+            args.evaluator, args.base_url, evaluator_model, SYSTEM, prompt,
+            budget, args.temperature, args.reasoning, args.timeout
+        )
+        try:
+            parsed = extract_json(raw)
+        except RuntimeError:
+            retry_budget = min(args.max_tokens_facts, max(budget * 2, 4096))
+            if retry_budget <= budget:
+                raise
+            print(
+                f"    Invalid JSON from fact extractor; retrying with "
+                f"{retry_budget:,} output tokens..."
+            )
+            retry_raw, retry_usage, retry_elapsed, _ = chat(
+                args.evaluator, args.base_url, evaluator_model, SYSTEM, prompt,
+                retry_budget, args.temperature, args.reasoning, args.timeout
+            )
+            raw = retry_raw
+            usage = retry_usage
+            elapsed += retry_elapsed
+            parsed = extract_json(raw)
         facts = parsed.get("facts", []) if isinstance(parsed, dict) else []
         # Ensure stable IDs even if evaluator omitted/duplicated IDs.
         normalized = []
@@ -1381,9 +1324,36 @@ def run(args):
                 summary=summary,
                 source=chapter.text,
             )
-            budget = min(args.max_tokens_eval, max(args.min_output_tokens, dynamic_budget(prompt, args.max_tokens_eval, args.min_output_tokens)))
+            # Evaluation responses can be substantially larger than the input-size
+            # based dynamic budget suggests: the evaluator must emit one JSON object
+            # containing every fact result plus model claims.  A chapter with 20-40
+            # facts can therefore legitimately need several thousand output tokens.
+            # Use the dynamic budget as a lower bound only, then retry at the full
+            # configured cap if the first response is truncated/invalid JSON.
+            initial_budget = min(
+                args.max_tokens_eval,
+                max(args.min_output_tokens, dynamic_budget(prompt, args.max_tokens_eval, args.min_output_tokens))
+            )
+            budget = initial_budget
             raw, usage, elapsed, _ = chat(args.evaluator, args.base_url, evaluator_model, SYSTEM, prompt, budget, args.temperature, args.reasoning, args.timeout)
-            parsed = extract_json(raw)
+            try:
+                parsed = extract_json(raw)
+            except RuntimeError:
+                if budget >= args.max_tokens_eval:
+                    raise
+                retry_budget = args.max_tokens_eval
+                print(f"    JSON response incomplete/invalid; retrying with --max-tokens-eval={retry_budget}")
+                retry_raw, retry_usage, retry_elapsed, _ = chat(
+                    args.evaluator, args.base_url, evaluator_model, SYSTEM, prompt,
+                    retry_budget, args.temperature, args.reasoning, args.timeout
+                )
+                parsed = extract_json(retry_raw)
+                raw = retry_raw
+                usage = {
+                    "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0) + int(retry_usage.get("prompt_tokens", 0) or 0),
+                    "completion_tokens": int(usage.get("completion_tokens", 0) or 0) + int(retry_usage.get("completion_tokens", 0) or 0),
+                }
+                elapsed += retry_elapsed
             result = {
                 "chapter": chapter.number,
                 "title": chapter.title,
@@ -1406,7 +1376,7 @@ def run(args):
             "label": label,
             "run_dir": str(run_dir),
             "model": model_key,
-            "model_info": book_info.get("model_info") or {},
+            "model_info": book_info.get("model_info", {}),
             "runtime_seconds": float(run_stats.get("total_elapsed_seconds", 0) or 0),
             "runtime_minutes": float(run_stats.get("total_elapsed_seconds", 0) or 0) / 60,
             "prompt_tokens": int(run_stats.get("total_prompt_tokens", 0) or 0),
@@ -1459,10 +1429,8 @@ def run(args):
         save_json(eval_root / safe_name(Path(item["run_dir"]).parent.name) / Path(item["run_dir"]).name / "book_evaluation.json", result)
 
     for item in model_reports:
-        match = next((x for x in book_level if x.get("run_dir") == item["run_dir"]), None)
-        item["book_evaluation"] = (match.get("result") or {}) if isinstance(match, dict) else {}
-        item["model_info"] = item.get("model_info") or {}
-        item["aggregate"] = item.get("aggregate") or {}
+        match = next((x for x in book_level if x["run_dir"] == item["run_dir"]), None)
+        item["book_evaluation"] = match["result"] if match else {}
 
     report = {
         "generated_at": datetime.now().astimezone().isoformat(),
