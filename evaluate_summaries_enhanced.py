@@ -850,6 +850,32 @@ def _safe_get(obj, key, default=None):
     return default if value is None else value
 
 
+DEFAULT_OVERALL_FACT_WEIGHT = 0.70
+DEFAULT_OVERALL_STORY_WEIGHT = 0.30
+
+def default_adjusted_score(item: dict) -> float:
+    a = _safe_dict(item.get("aggregate"))
+    base = float(a.get("weighted_coverage", 0) or 0)
+    fc = _safe_dict(a.get("fact_counts"))
+    all_facts = missing = contradicted = 0
+    for imp in ("critical", "major", "moderate", "minor"):
+        c = _safe_dict(fc.get(imp))
+        all_facts += sum(int(c.get(k, 0) or 0) for k in ("supported", "partial", "missing", "contradicted"))
+        missing += int(c.get("missing", 0) or 0)
+        contradicted += int(c.get("contradicted", 0) or 0)
+    miss_rate = missing / all_facts if all_facts else 0.0
+    contra_rate = contradicted / all_facts if all_facts else 0.0
+    claims = _safe_dict(a.get("claims"))
+    claim_total = sum(int(claims.get(k, 0) or 0) for k in ("supported", "partial", "unsupported", "contradicted"))
+    unsupported_rate = int(claims.get("unsupported", 0) or 0) / max(1, claim_total)
+    return max(0.0, base - 0.10 * miss_rate - 0.25 * contra_rate - 0.05 * unsupported_rate)
+
+def default_overall_score(item: dict) -> float:
+    adjusted = default_adjusted_score(item)
+    story = float(_safe_dict(item.get("book_evaluation")).get("story_arc_coverage", 0) or 0)
+    return DEFAULT_OVERALL_FACT_WEIGHT * adjusted + DEFAULT_OVERALL_STORY_WEIGHT * story
+
+
 def markdown_report(path: Path, report: dict) -> None:
     lines = [
         f"# EPUB LLM Summary Evaluation",
@@ -869,15 +895,16 @@ def markdown_report(path: Path, report: dict) -> None:
         "",
         "## Model comparison",
         "",
-        "| Model / run | Runtime | Story arc | Weighted coverage | Critical | Major | Unsupported claims | Critical omissions | Major omissions |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Model / run | Overall | Adjusted factual | Story arc | Weighted coverage | Runtime | Critical | Major | Unsupported claims | Critical omissions | Major omissions |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
+    lines += [f"Default overall score: **{DEFAULT_OVERALL_FACT_WEIGHT*100:.0f}% adjusted factual + {DEFAULT_OVERALL_STORY_WEIGHT*100:.0f}% story arc**.", ""]
     for item in report["models"]:
         a = item["aggregate"]
         lines.append(
-            f"| `{item['label']}` | {item['runtime_minutes']:.1f} min | "
+            f"| `{item['label']}` | {pct(default_overall_score(item))} | {pct(default_adjusted_score(item))} | "
             f"{pct((_safe_dict(item.get('book_evaluation')).get('story_arc_coverage', 0)))} | "
-            f"{pct(a['weighted_coverage'])} | {pct(a['coverage']['critical'])} | "
+            f"{pct(a['weighted_coverage'])} | {item['runtime_minutes']:.1f} min | {pct(a['coverage']['critical'])} | "
             f"{pct(a['coverage']['major'])} | {a['claims']['unsupported']} | "
             f"{len(a['critical_omissions'])} | {len(a['major_omissions'])} |"
         )
@@ -978,16 +1005,18 @@ table{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%
 <div class="control"><label>Omission penalty (pp / 100% weighted missing)</label><input id="pMissing" type="number" min="0" step=".1" value="10"></div>
 <div class="control"><label>Contradiction penalty (pp / 100% weighted contradicted)</label><input id="pContradicted" type="number" min="0" step=".1" value="25"></div>
 <div class="control"><label>Unsupported-claim penalty (pp / 100 claims)</label><input id="pUnsupported" type="number" min="0" step=".1" value="5"></div>
+<div class="control"><label>Overall factual weight</label><input id="overallFact" type="number" min="0" max="100" step="5" value="70"></div>
+<div class="control"><label>Overall story-arc weight</label><input id="overallStory" type="number" min="0" max="100" step="5" value="30"></div>
 <div class="control"><button onclick="resetWeights()">Reset defaults</button></div>
 </div>
-<p class="muted">Adjusted score = weighted coverage − omission penalty − contradiction penalty − unsupported-claim penalty. Penalties are normalized, so changing weights changes the effective importance of omissions/contradictions too. This is an analysis aid, not a new evaluator judgment.</p>
+<p class="muted">Adjusted score = weighted factual coverage − omission penalty − contradiction penalty − unsupported-claim penalty. Overall score = adjusted factual score × factual weight + story-arc coverage × story-arc weight. Overall is a reporting/analysis metric, not a new evaluator judgment. Default: 70% factual + 30% story arc.</p>
 </section>
 
 <div class="cards grid" id="cards"></div>
 
 <section class="charts">
 <div class="charts-left">
-<div class="panel chart"><h2>Adjusted score</h2><div id="scoreChart"></div></div>
+<div class="panel chart"><h2>Overall score</h2><div class="muted" style="font-size:12px;margin:-4px 0 8px">70% factual + 30% story arc by default; adjustable above.</div><div id="scoreChart"></div></div>
 <div class="panel chart"><h2>Runtime vs. weighted coverage</h2><div id="runtimeCoverageChart"></div></div>
 </div>
 <div class="panel chart charts-coverage"><h2>Coverage by importance</h2><div id="importanceLegend" class="legend"></div><div id="importanceChart"></div></div>
@@ -1006,43 +1035,51 @@ table{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%
 const REPORT=__REPORT_JSON__;
 const excluded=/deepseek-r1-distill-qwen-32b/i;
 let models=REPORT.models.filter(m=>!excluded.test(m.label));
-const defaults={critical:4,major:3,moderate:2,minor:1,partial:.5,pMissing:10,pContradicted:25,pUnsupported:5};
+const defaults={critical:4,major:3,moderate:2,minor:1,partial:.5,pMissing:10,pContradicted:25,pUnsupported:5,overallFact:70,overallStory:30};
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const pct=x=>(100*(x||0)).toFixed(1)+"%";
 const mins=x=>(x||0).toFixed(1)+" min";
 function val(id){return parseFloat(document.getElementById(id).value)||0}
 function weights(){return {critical:val("wCritical"),major:val("wMajor"),moderate:val("wModerate"),minor:val("wMinor")}}
 function metrics(m){
- const a=m.aggregate,c=a.fact_counts,w=weights(); let den=0,num=0,miss=0,contra=0;
- for(const imp of ["critical","major","moderate","minor"]){
-   const x=c[imp], total=x.supported+x.partial+x.missing+x.contradicted, ww=w[imp];
-   den+=total*ww; num+=(x.supported+val("partial")*x.partial)*ww; miss+=x.missing*ww; contra+=x.contradicted*ww;
- }
- const base=den?num/den:0, missRate=den?miss/den:0, contraRate=den?contra/den:0;
- const claims=a.claims||{}, claimTotal=(claims.supported||0)+(claims.partial||0)+(claims.unsupported||0)+(claims.contradicted||0);
- const unsupportedRate=claimTotal?(claims.unsupported||0)/claimTotal:0;
- const adjusted=Math.max(0,base-val("pMissing")/100*missRate-val("pContradicted")/100*contraRate-val("pUnsupported")/100*unsupportedRate);
- return {base,adjusted,missRate,contraRate,unsupportedRate};
+  const a=m.aggregate||{}, c=a.claims||{}, fc=a.fact_counts||{};
+  const weights={critical:val("wCritical"),major:val("wMajor"),moderate:val("wModerate"),minor:val("wMinor")};
+  let total=0,hit=0;
+  for(const k of Object.keys(weights)){const x=fc[k]||{};const n=(x.supported||0)+(x.partial||0)+(x.missing||0)+(x.contradicted||0);const h=(x.supported||0)+val("partial")*(x.partial||0);total+=n*weights[k];hit+=h*weights[k];}
+  const base=total?hit/total:1;
+  const allFacts=Object.values(fc).reduce((s,x)=>s+(x.supported||0)+(x.partial||0)+(x.missing||0)+(x.contradicted||0),0);
+  const missing=Object.values(fc).reduce((s,x)=>s+(x.missing||0),0);
+  const contradicted=Object.values(fc).reduce((s,x)=>s+(x.contradicted||0),0);
+  const missRate=allFacts?missing/allFacts:0, contraRate=allFacts?contradicted/allFacts:0;
+  const unsupportedRate=(c.unsupported||0)/Math.max(1,(c.supported||0)+(c.partial||0)+(c.unsupported||0)+(c.contradicted||0));
+  const adjusted=Math.max(0,base-val("pMissing")/100*missRate-val("pContradicted")/100*contraRate-val("pUnsupported")/100*unsupportedRate);
+  const fw=val("overallFact")/100, sw=val("overallStory")/100, sum=fw+sw;
+  const factWeight=sum?fw/sum:.7, storyWeight=sum?sw/sum:.3;
+  const story=Number(m.book_evaluation?.story_arc_coverage||0);
+  const overall=adjusted*factWeight+story*storyWeight;
+  return {base,adjusted,story,overall,factWeight,storyWeight,missRate,contraRate,unsupportedRate};
 }
-function resetWeights(){for(const [k,v] of Object.entries(defaults)){const id={critical:"wCritical",major:"wMajor",moderate:"wModerate",minor:"wMinor",partial:"partial",pMissing:"pMissing",pContradicted:"pContradicted",pUnsupported:"pUnsupported"}[k];document.getElementById(id).value=v}render()}
+function resetWeights(){for(const [k,v] of Object.entries(defaults)){const id={critical:"wCritical",major:"wMajor",moderate:"wModerate",minor:"wMinor",partial:"partial",pMissing:"pMissing",pContradicted:"pContradicted",pUnsupported:"pUnsupported",overallFact:"overallFact",overallStory:"overallStory"}[k];document.getElementById(id).value=v}render()}
 function label(m){return m.model_info?.display_name||m.model||m.label}
 function renderCards(){
  const avg=models.reduce((s,m)=>s+metrics(m).adjusted,0)/Math.max(1,models.length);
+ const avgOverall=models.reduce((s,m)=>s+metrics(m).overall,0)/Math.max(1,models.length);
  const avgStoryArc=models.reduce((s,m)=>s+(m.book_evaluation?.story_arc_coverage||0),0)/Math.max(1,models.length);
- const best=models.reduce((b,m)=>!b||metrics(m).adjusted>metrics(b).adjusted?m:b,null);
+ const best=models.reduce((b,m)=>!b||metrics(m).overall>metrics(b).overall?m:b,null);
  const totalFacts=models.length?Object.values(models[0].aggregate.fact_counts).reduce((s,x)=>s+Object.values(x).reduce((a,b)=>a+b,0),0):0;
  document.getElementById("cards").innerHTML=[
  `<div class="card"><b>${models.length}</b><span>models included</span></div>`,
+ `<div class="card"><b>${pct(avgOverall)}</b><span>average overall score</span></div>`,
  `<div class="card"><b>${pct(avgStoryArc)}</b><span>average story arc coverage</span></div>`,
- `<div class="card"><b>${pct(avg)}</b><span>average adjusted score</span></div>`,
- `<div class="card"><b>${pct(best?metrics(best).adjusted:0)}</b><span>highest adjusted score</span></div>`,
+ `<div class="card"><b>${pct(avg)}</b><span>average adjusted factual score</span></div>`,
+ `<div class="card"><b>${pct(best?metrics(best).overall:0)}</b><span>highest overall score</span></div>`,
  `<div class="card"><b>${totalFacts}</b><span>reference facts / model</span></div>`,
  `<div class="card"><b>${esc(REPORT.evaluator?.display_name||REPORT.evaluator?.model||"?")}</b><span>evaluator</span></div>`
  ].join("");
 }
 function renderScoreChart(){
- const arr=[...models].sort((a,b)=>metrics(b).adjusted-metrics(a).adjusted);
- document.getElementById("scoreChart").innerHTML=arr.map(m=>{const x=metrics(m);return `<div class="barrow"><span>${esc(label(m))}</span><div class="bar"><div class="fill good" style="width:${x.adjusted*100}%"></div></div><b>${pct(x.adjusted)}</b></div>`}).join("");
+ const arr=[...models].sort((a,b)=>metrics(b).overall-metrics(a).overall);
+ document.getElementById("scoreChart").innerHTML=arr.map(m=>{const x=metrics(m);return `<div class="barrow"><span>${esc(label(m))}</span><div class="bar"><div class="fill good" style="width:${x.overall*100}%"></div></div><b>${pct(x.overall)}</b></div>`}).join("");
 }
 function renderImportance(){
  const colors={
@@ -1112,9 +1149,9 @@ function renderRuntimeCoverage(){
    `${dots}</svg>`;
 }
 const columns=[
- ["model","Model","Model/run being compared."],["adjusted","Adjusted","Base weighted coverage after subtracting the omission, contradiction, and unsupported-claim penalties. The penalties use the current controls above."],["storyArc","Story arc","Evaluator's book-level assessment of how well the summary represents the broader story arcs, major turning points, consequences, and overall story."],["base","Base weighted","Weighted factual coverage before penalties. Fact importance weights and the partial-credit setting are applied, but omission/contradiction/unsupported-claim penalties are not."],["runtime","Runtime","Time required to generate the model's summary, in minutes."],["critical","Critical","Coverage of reference facts classified as critical. Supported facts count fully; partial facts receive the configured partial-credit value."],["major","Major","Coverage of reference facts classified as major."],["moderate","Moderate","Coverage of reference facts classified as moderate."],["minor","Minor","Coverage of reference facts classified as minor."],["contradicted","Contradictions","Number of model claims judged contradicted by the reference/source."],["unsupported","Unsupported","Number of model claims judged unsupported by the reference/source."],["criticalO","Critical omissions","Number of critical reference facts omitted or not adequately covered."],["majorO","Major omissions","Number of major reference facts omitted or not adequately covered."]
+ ["model","Model","Model/run being compared."],["overall","Overall","Combined reporting score: adjusted factual score × factual weight + story-arc coverage × story-arc weight. Default 70% factual + 30% story arc; weights are adjustable."],["adjusted","Adjusted","Adjusted factual score: weighted factual coverage after subtracting the omission, contradiction, and unsupported-claim penalties. The penalties use the current controls above."],["storyArc","Story arc","Evaluator's book-level assessment of how well the summary represents the broader story arcs, major turning points, consequences, and overall story."],["base","Base weighted","Weighted factual coverage before penalties. Fact importance weights and the partial-credit setting are applied, but omission/contradiction/unsupported-claim penalties are not."],["runtime","Runtime","Time required to generate the model's summary, in minutes."],["critical","Critical","Coverage of reference facts classified as critical. Supported facts count fully; partial facts receive the configured partial-credit value."],["major","Major","Coverage of reference facts classified as major."],["moderate","Moderate","Coverage of reference facts classified as moderate."],["minor","Minor","Coverage of reference facts classified as minor."],["contradicted","Contradictions","Number of model claims judged contradicted by the reference/source."],["unsupported","Unsupported","Number of model claims judged unsupported by the reference/source."],["criticalO","Critical omissions","Number of critical reference facts omitted or not adequately covered."],["majorO","Major omissions","Number of major reference facts omitted or not adequately covered."]
 ];
-let sortKey="adjusted",sortDir=-1;
+let sortKey="overall",sortDir=-1;
 function renderHead(){
  document.getElementById("head").innerHTML=columns.map(([k,n,tip])=>`<th class="${k!=="model"?"num ":""}tip sort ${sortKey===k?(sortDir>0?"asc":"desc"):""}" data-tip="${esc(tip)}" onclick="sortBy('${k}')">${n}</th>`).join("");
  document.querySelectorAll("#head th.tip").forEach(th=>{
@@ -1139,7 +1176,7 @@ function showTableTip(th){
 function hideTableTip(){if(tableTipEl){tableTipEl.remove();tableTipEl=null;}}
 function rowValue(m,k){
  const a=m.aggregate,x=metrics(m);
- return {model:label(m),adjusted:x.adjusted,storyArc:m.book_evaluation?.story_arc_coverage||0,base:x.base,runtime:m.runtime_minutes||0,critical:a.coverage.critical||0,major:a.coverage.major||0,moderate:a.coverage.moderate||0,minor:a.coverage.minor||0,contradicted:a.claims?.contradicted||0,unsupported:a.claims?.unsupported||0,criticalO:a.critical_omissions?.length||0,majorO:a.major_omissions?.length||0}[k];
+ return {model:label(m),overall:x.overall,adjusted:x.adjusted,storyArc:x.story,base:x.base,runtime:m.runtime_minutes||0,critical:a.coverage.critical||0,major:a.coverage.major||0,moderate:a.coverage.moderate||0,minor:a.coverage.minor||0,contradicted:a.claims?.contradicted||0,unsupported:a.claims?.unsupported||0,criticalO:a.critical_omissions?.length||0,majorO:a.major_omissions?.length||0}[k];
 }
 function renderTable(){
  const q=(document.getElementById("modelSearch").value||"").toLowerCase();
@@ -1147,7 +1184,7 @@ function renderTable(){
  arr.sort((a,b)=>{let x=rowValue(a,sortKey),y=rowValue(b,sortKey);if(typeof x==="string")return sortDir*x.localeCompare(y);return sortDir*(x-y)});
  document.getElementById("tbody").innerHTML=arr.map(m=>{const a=m.aggregate,x=metrics(m);return `<tr>
  <td><b>${esc(label(m))}</b><br><span class="muted">${esc(m.label)}</span></td>
- <td class="num score">${pct(x.adjusted)}</td><td class="num score">${pct(m.book_evaluation?.story_arc_coverage||0)}</td><td class="num">${pct(x.base)}</td><td class="num">${mins(m.runtime_minutes)}</td>
+ <td class="num score">${pct(x.overall)}</td><td class="num score">${pct(x.adjusted)}</td><td class="num score">${pct(x.story)}</td><td class="num">${pct(x.base)}</td><td class="num">${mins(m.runtime_minutes)}</td>
  <td class="num">${pct(a.coverage.critical)}</td><td class="num">${pct(a.coverage.major)}</td><td class="num">${pct(a.coverage.moderate)}</td><td class="num">${pct(a.coverage.minor)}</td>
  <td class="num">${a.claims?.contradicted||0}</td><td class="num">${a.claims?.unsupported||0}</td><td class="num">${a.critical_omissions?.length||0}</td><td class="num">${a.major_omissions?.length||0}</td>
  </tr>`}).join("");
@@ -1160,10 +1197,10 @@ function issueList(arr,limit=100){
 function renderDetails(){
  document.getElementById("details").innerHTML=models.map((m,i)=>{const a=m.aggregate,x=metrics(m),mi=m.model_info||{},b=m.book_evaluation||{};
  const counts=a.fact_counts;
- return `<details class="details"><summary>${esc(label(m))} — <span class="score">${pct(b.story_arc_coverage)}</span> story arc / <span class="score">${pct(x.base)}</span> weighted / <span class="score">${pct(x.adjusted)}</span> adjusted · ${mins(m.runtime_minutes)}</summary>
+ return `<details class="details"><summary>${esc(label(m))} — <span class="score">${pct(x.overall)}</span> overall / <span class="score">${pct(x.adjusted)}</span> adjusted / <span class="score">${pct(b.story_arc_coverage)}</span> story arc / <span class="score">${pct(x.base)}</span> weighted · ${mins(m.runtime_minutes)}</summary>
  <div class="detailbody">
  <div class="grid cards" style="margin:0 0 10px;grid-template-columns:repeat(auto-fit,minmax(120px,1fr))">
- <div class="card"><b>${pct(b.story_arc_coverage)}</b><span>story arc coverage</span></div><div class="card"><b>${pct(x.base)}</b><span>base weighted</span></div><div class="card"><b>${pct(x.adjusted)}</b><span>adjusted</span></div>
+ <div class="card"><b>${pct(x.overall)}</b><span>overall</span></div><div class="card"><b>${pct(x.adjusted)}</b><span>adjusted factual</span></div><div class="card"><b>${pct(b.story_arc_coverage)}</b><span>story arc coverage</span></div><div class="card"><b>${pct(x.base)}</b><span>base weighted</span></div>
  <div class="card"><b>${a.claims?.contradicted||0}</b><span>contradictions</span></div><div class="card"><b>${a.claims?.unsupported||0}</b><span>unsupported claims</span></div>
  </div>
  <p><b>Model:</b> ${esc(mi.display_name||m.model)} · <b>Key:</b> ${esc(m.model)} · <b>Variant:</b> ${esc(mi.selected_variant||"?")} · <b>Quantization:</b> ${esc(mi.quantization?.name||"?")} · <b>Runtime:</b> ${mins(m.runtime_minutes)} · <b>Prompt:</b> ${(m.prompt_tokens||0).toLocaleString()} · <b>Completion:</b> ${(m.completion_tokens||0).toLocaleString()}</p>
@@ -1174,7 +1211,7 @@ function renderDetails(){
  <details class="subdetails"><summary>Unsupported claims (${a.unsupported_claims?.length||0})</summary>${issueList(a.unsupported_claims)}</details>
  <details class="subdetails"><summary>Contradictions (${a.contradictions?.length||0})</summary>${issueList(a.contradictions)}</details>
  <details class="subdetails"><summary>Book-level evaluation</summary>
- <div><b>Story arc coverage:</b> ${pct(b.story_arc_coverage)} · <b>Weighted:</b> ${pct(b.weighted_coverage)} · <b>Critical:</b> ${pct(b.critical_coverage)} · <b>Major:</b> ${pct(b.major_coverage)} · <b>Moderate:</b> ${pct(b.moderate_coverage)} · <b>Minor:</b> ${pct(b.minor_coverage)}</div>
+ <div><b>Overall:</b> ${pct(x.overall)} · <b>Adjusted factual:</b> ${pct(x.adjusted)} · <b>Story arc coverage:</b> ${pct(b.story_arc_coverage)} · <b>Weighted:</b> ${pct(b.weighted_coverage)} · <b>Critical:</b> ${pct(b.critical_coverage)} · <b>Major:</b> ${pct(b.major_coverage)} · <b>Moderate:</b> ${pct(b.moderate_coverage)} · <b>Minor:</b> ${pct(b.minor_coverage)}</div>
  <details class="subdetails"><summary>Book critical omissions</summary>${issueList((b.critical_omissions||[]).map(x=>({note:x})))} </details>
  <details class="subdetails"><summary>Book major omissions</summary>${issueList((b.major_omissions||[]).map(x=>({note:x})))} </details>
  <details class="subdetails"><summary>Book unsupported claims</summary>${issueList((b.unsupported_claims||[]).map(x=>({note:x})))} </details>
