@@ -954,6 +954,12 @@ def markdown_report(path: Path, report: dict) -> None:
                 lines.append(f"- Chapter {x['chapter']} / {x['fact_id']}: {x['note']}")
         else:
             lines.append("None detected.")
+        lines += ["", "#### Complete-book summary", ""]
+        book_summary = item.get("book_summary") or ""
+        if book_summary:
+            lines += ["```markdown", book_summary, "```"]
+        else:
+            lines.append("No complete-book summary found for this run.")
         lines.append("")
 
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -982,7 +988,7 @@ h1{margin:0 0 4px;font-size:26px}h2{margin:28px 0 12px}h3{margin:18px 0 8px}.mut
 .sort{cursor:pointer;user-select:none;white-space:nowrap}.sort:after{content:" ↕";color:#9aa1a8}.sort.asc:after{content:" ↑"}.sort.desc:after{content:" ↓"}
 table{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%;background:white;table-layout:auto}th,td{border-bottom:1px solid var(--line);padding:8px;text-align:left;vertical-align:top}th{background:#f0f3f6;z-index:2;white-space:nowrap}th:first-child,td:first-child{min-width:220px}td{white-space:nowrap}.tablewrap{overflow-x:auto;overflow-y:visible;max-width:100%;-webkit-overflow-scrolling:touch}td.num,th.num{text-align:right}tr:hover td{background:#fafbfc}th.tip{position:relative;cursor:help}th.tip::after{content:"ⓘ";display:inline-block;margin-left:5px;font-size:11px;font-weight:600;color:#68737d;vertical-align:1px}.table-tooltip{position:fixed;z-index:9999;max-width:330px;padding:9px 11px;border-radius:7px;background:#17202a;color:#fff;font-size:12px;line-height:1.4;box-shadow:0 4px 14px rgba(0,0,0,.2);pointer-events:none;white-space:normal}
 .pill{display:inline-block;border-radius:999px;padding:2px 7px;font-size:12px;background:#edf0f2}.score{font-weight:700}.details{margin-top:12px}.details>summary{cursor:pointer;font-weight:700;padding:10px;background:#fff;border:1px solid var(--line);border-radius:8px}.details[open]>summary{border-radius:8px 8px 0 0}
-.detailbody{background:#fff;border:1px solid var(--line);border-top:0;padding:12px}.subdetails{margin:8px 0}.subdetails summary{cursor:pointer;font-weight:600}.issue{padding:7px 0;border-bottom:1px solid #eef0f2}.issue small{color:var(--muted)}
+.detailbody{background:#fff;border:1px solid var(--line);border-top:0;padding:12px}.booksummary{margin-top:10px;padding:12px;background:#f8fafc;border:1px solid var(--line);border-radius:8px;white-space:pre-wrap;overflow:auto;max-height:900px;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}.subdetails{margin:8px 0}.subdetails summary{cursor:pointer;font-weight:600}.issue{padding:7px 0;border-bottom:1px solid #eef0f2}.issue small{color:var(--muted)}
 .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted)}.dot{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px}
 .search{width:100%;padding:9px;border:1px solid #cbd2d8;border-radius:7px;margin:8px 0 12px}.note{background:#fff8e6;border:1px solid #f1d58a;padding:10px;border-radius:8px}
 @media(max-width:800px){.charts{grid-template-columns:1fr}main{padding:12px}th{top:115px}}
@@ -1217,6 +1223,7 @@ function renderDetails(){
  <details class="subdetails"><summary>Book unsupported claims</summary>${issueList((b.unsupported_claims||[]).map(x=>({note:x})))} </details>
  <details class="subdetails"><summary>Book contradictions</summary>${issueList((b.contradictions||[]).map(x=>({note:x})))} </details>
  </details>
+ <details class="subdetails"><summary>Complete-book summary</summary><div class="booksummary">${esc(m.book_summary||"No complete-book summary found for this run.")}</div></details>
  </div></details>`}).join("");
 }
 function render(){renderCards();renderScoreChart();renderImportance();renderRuntimeCoverage();renderHead();renderTable();renderDetails()}
@@ -1483,6 +1490,7 @@ def run(args):
             "runtime_minutes": float(run_stats.get("total_elapsed_seconds", 0) or 0) / 60,
             "prompt_tokens": int(run_stats.get("total_prompt_tokens", 0) or 0),
             "completion_tokens": int(run_stats.get("total_completion_tokens", 0) or 0),
+            "book_summary": read_book_summary(run_dir),
             "evaluation_runtime_seconds": total_eval_elapsed,
             "evaluation_prompt_tokens": total_eval_prompt,
             "evaluation_completion_tokens": total_eval_completion,
