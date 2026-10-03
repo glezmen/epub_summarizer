@@ -4,7 +4,7 @@ EPUB -> chapter summaries benchmark for LM Studio.
 
 Designed for reproducible local-LLM comparisons:
 - extracts the EPUB reading order from content.opf
-- detects numbered chapters and EPILOGUE
+- detects numbered chapters and EPILOGUE, including multiple chapters embedded in one XHTML file
 - ignores front/back matter
 - splits long chapters into deterministic chunks
 - sends the same prompts to the LM Studio OpenAI-compatible API
@@ -280,6 +280,88 @@ def detect_chapter_marker(headings: list[str], text: str) -> tuple[Optional[str]
     return None, None
 
 
+CHAPTER_WORD_VALUES = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+    "fourteen": 14, "fifteen": 15, "sixteen": 16,
+    "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+}
+
+
+def parse_embedded_chapter_heading(line: str) -> tuple[Optional[str], Optional[str]]:
+    """Parse a standalone chapter heading found inside an XHTML document."""
+    value = clean_text(line).strip()
+    if not value:
+        return None, None
+
+    m = re.fullmatch(r"CHAPTER\s+(\d+)(?:\s*[:.-]\s*(.*))?", value, re.IGNORECASE)
+    if m:
+        number = m.group(1)
+        suffix = clean_text(m.group(2) or "")
+        return number, (suffix or f"Chapter {number}")
+
+    m = re.fullmatch(r"CHAPTER\s+([IVXLCDM]+)(?:\s*[:.-]\s*(.*))?", value, re.IGNORECASE)
+    if m:
+        number = roman_to_int(m.group(1))
+        if number is not None:
+            suffix = clean_text(m.group(2) or "")
+            return str(number), (suffix or f"Chapter {number}")
+
+    m = re.fullmatch(r"CHAPTER\s+([A-Za-z]+(?:[- ]+[A-Za-z]+)?)(?:\s*[:.-]\s*(.*))?", value, re.IGNORECASE)
+    if m:
+        words = re.sub(r"-", " ", m.group(1)).lower().split()
+        if words and all(word in CHAPTER_WORD_VALUES for word in words):
+            number = CHAPTER_WORD_VALUES[words[0]]
+            if len(words) == 2 and words[0] in {
+                "twenty", "thirty", "forty", "fifty", "sixty",
+                "seventy", "eighty", "ninety",
+            }:
+                number += CHAPTER_WORD_VALUES[words[1]]
+            elif len(words) > 1:
+                return None, None
+            suffix = clean_text(m.group(2) or "")
+            return str(number), (suffix or f"Chapter {number}")
+
+    if value.upper() in {"EPILOGUE", "EPILÓGUS"}:
+        return "EPILOGUE", "Epilogue"
+
+    return None, None
+
+
+def split_embedded_chapters(text: str) -> list[tuple[str, str, str]]:
+    """Split a single XHTML document containing multiple chapter headings.
+
+    This handles books such as Celestia: CV-02 where all ten chapters live in
+    OEBPS/text00001.html and are separated by standalone headings such as
+    "CHAPTER ONE". Front matter before the first heading is discarded.
+    """
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = normalized.split("\n")
+    markers: list[tuple[int, str, str]] = []
+
+    for index, line in enumerate(lines):
+        number, title = parse_embedded_chapter_heading(line)
+        if number is not None:
+            markers.append((index, number, title or f"Chapter {number}"))
+
+    # Require at least two embedded chapters. A single chapter is handled by
+    # the normal detector below, avoiding unnecessary changes to old EPUBs.
+    if len(markers) < 2:
+        return []
+
+    result: list[tuple[str, str, str]] = []
+    for marker_index, (start, number, title) in enumerate(markers):
+        end = markers[marker_index + 1][0] if marker_index + 1 < len(markers) else len(lines)
+        chapter_text = clean_text("\n".join(lines[start + 1:end]))
+        if chapter_text:
+            result.append((number, title, chapter_text))
+
+    return result
+
+
 def read_epub(epub_path: Path) -> tuple[str, str, list[Chapter]]:
     with zipfile.ZipFile(epub_path, "r") as z:
         opf_path = find_opf_path(z)
@@ -341,6 +423,16 @@ def read_epub(epub_path: Path) -> tuple[str, str, list[Chapter]]:
             # Some EPUBs put the table of contents in the spine and use a
             # generic filename.  Filter it before chapter-number detection.
             if is_toc_document(full_path, headings, text):
+                continue
+
+            # Some EPUBs store the entire novel in ONE XHTML file. In that
+            # layout the individual chapter markers occur inside the document
+            # (e.g. "CHAPTER ONE", "CHAPTER TWO", ...), so detecting only the
+            # first marker would incorrectly turn the whole book into chapter 1.
+            embedded = split_embedded_chapters(text)
+            if embedded:
+                for number, title, chapter_text in embedded:
+                    chapters.append(Chapter(number, title, full_path, chapter_text))
                 continue
 
             number, title = detect_chapter_marker(headings, text)
