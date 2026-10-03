@@ -467,9 +467,86 @@ def split_text(text: str, max_chars: int, overlap: int) -> list[str]:
         return [chunks[0]] + [(chunks[i-1][-overlap:] + "\n\n" + chunks[i]).strip() for i in range(1,len(chunks))]
     return chunks
 
+class TokenCalibration:
+    """Calibrate the rough character/token estimate from LM Studio usage.
+
+    The benchmark cannot tokenize every prompt with the exact model tokenizer
+    locally, so it starts with the historical 3.5 chars/token heuristic and
+    gradually replaces it with an observed cumulative ratio from LM Studio's
+    authoritative ``prompt_tokens`` value. Bounds keep unusual prompts from
+    making the estimator unstable.
+    """
+
+    def __init__(self, initial_chars_per_token: float = 3.5,
+                 min_chars_per_token: float = 2.0,
+                 max_chars_per_token: float = 6.0):
+        self.initial = float(initial_chars_per_token)
+        self.min_ratio = float(min_chars_per_token)
+        self.max_ratio = float(max_chars_per_token)
+        self.total_chars = 0
+        self.total_tokens = 0
+        self.samples = 0
+
+    @property
+    def chars_per_token(self) -> float:
+        if self.total_tokens <= 0:
+            return self.initial
+        ratio = self.total_chars / self.total_tokens
+        return max(self.min_ratio, min(self.max_ratio, ratio))
+
+    def estimate(self, text: str) -> int:
+        return max(1, int(len(text) / self.chars_per_token))
+
+    def observe(self, text: str, prompt_tokens: int) -> bool:
+        if not text or prompt_tokens <= 0:
+            return False
+        self.total_chars += len(text)
+        self.total_tokens += int(prompt_tokens)
+        self.samples += 1
+        return True
+
+    def snapshot(self) -> dict:
+        return {
+            "initial_chars_per_token": self.initial,
+            "min_chars_per_token": self.min_ratio,
+            "max_chars_per_token": self.max_ratio,
+            "chars_per_token": round(self.chars_per_token, 6),
+            "samples": self.samples,
+            "observed_characters": self.total_chars,
+            "observed_prompt_tokens": self.total_tokens,
+        }
+
+
+_TOKEN_CALIBRATION = TokenCalibration()
+
+
+def reset_token_calibration() -> None:
+    global _TOKEN_CALIBRATION
+    _TOKEN_CALIBRATION = TokenCalibration()
+
+
+def get_token_calibration() -> dict:
+    return _TOKEN_CALIBRATION.snapshot()
+
+
+def calibrate_prompt_tokens(prompt: str, usage: dict) -> None:
+    """Feed authoritative prompt-token usage back into the estimator."""
+    prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+    before = _TOKEN_CALIBRATION.chars_per_token
+    if _TOKEN_CALIBRATION.observe(prompt, prompt_tokens):
+        after = _TOKEN_CALIBRATION.chars_per_token
+        # Avoid noisy output for tiny changes, but make calibration visible.
+        if _TOKEN_CALIBRATION.samples <= 3 or abs(after - before) / max(before, 0.001) >= 0.05:
+            print(
+                f"  Token calibration: {_TOKEN_CALIBRATION.samples} sample(s), "
+                f"~{after:.3f} chars/token "
+                f"(observed {prompt_tokens:,} prompt tokens)",
+                file=sys.stderr,
+            )
+
+
 def estimate_tokens(text: str) -> int:
-    # Conservative estimate used only for deciding whether a chapter fits.
-    return max(1, int(len(text) / 3.5))
+    return _TOKEN_CALIBRATION.estimate(text)
 
 def choose_output_tokens(text: str, cap: int, minimum: int = 2048, ratio: float = 0.5) -> int:
     """Choose an output budget from the approximate input size.
@@ -783,6 +860,7 @@ def chat(
         response = api_request(url, payload, timeout, max_retries=max_retries, retry_base_delay=retry_base_delay)
         elapsed = time.perf_counter() - started
         content, usage = parse_native(response)
+        calibrate_prompt_tokens(prompt, usage)
         return content, usage, elapsed
 
     # For reasoning-enabled models, prefer the OpenAI-compatible endpoint.
@@ -831,6 +909,7 @@ def chat(
             "lmstudio_stats": {**openai_usage, "endpoint": "/v1/chat/completions", "finish_reason": choice.get("finish_reason")},
             "reasoning_content": reasoning_content,
         }
+        calibrate_prompt_tokens(prompt, usage)
         return content, usage, elapsed
 
     if reasoning != "off":
@@ -1398,6 +1477,7 @@ def dry_run_plan(args) -> None:
 
 
 def run(args):
+    reset_token_calibration()
     if args.max_retries < 0:
         raise ValueError("--max-retries must be zero or greater")
     if args.retry_base_delay < 0:
@@ -1468,6 +1548,7 @@ def run(args):
     print(f"Reasoning:  {effective_reasoning} (requested: {args.reasoning})")
     print(f"Reasoning supported: {', '.join(allowed_reasoning) if allowed_reasoning else 'metadata unavailable'}")
     print(f"Context:    {effective_context:,} tokens")
+    print(f"Token estimate: initial {get_token_calibration()['chars_per_token']:.2f} chars/token; calibrated from API usage during run")
     print(f"Chunking:   explicit {args.chunk_size:,} input tokens/chunk" if args.chunk_size else "Chunking:   whole chapter when it fits; adaptive fallback otherwise")
     print(f"Output:     {output_dir}")
     print(f"Run ID:     {run_id}")
@@ -1509,6 +1590,7 @@ def run(args):
                 "max_tokens_book": args.max_tokens_book,
                 "max_book_summary_passes": args.max_book_summary_passes,
                 "context": effective_context,
+                "token_calibration": get_token_calibration(),
                 "loaded_instance": (model_info.get("loaded_instances") or [{}])[0],
                 "chunking": (
                     f"explicit {args.chunk_size} input tokens/chunk"
@@ -1902,6 +1984,15 @@ def run(args):
             "generation_method": "hierarchical", "generation_passes": level + 1,
             "elapsed_seconds": final_elapsed, "usage": final_usage})
 
+    # Persist the final calibration so a benchmark run records the estimator
+    # state that was actually used for its later context/chunk decisions.
+    try:
+        book_info = load_json(book_info_path)
+        book_info["token_calibration"] = get_token_calibration()
+        save_json(book_info_path, book_info)
+    except (OSError, ValueError, TypeError):
+        print("WARNING: could not update token calibration metadata.", file=sys.stderr)
+
     save_json(
         output_dir / "run_stats.json",
         {
@@ -1931,6 +2022,7 @@ def run(args):
             "total_prompt_tokens": total_prompt_tokens,
             "total_completion_tokens": total_completion_tokens,
             "total_reasoning_tokens": total_reasoning_tokens,
+            "token_calibration": get_token_calibration(),
         },
     )
 
