@@ -25,9 +25,12 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import json
+import hashlib
+import contextlib
 import html
 import re
 import sys
+import random
 import time
 import urllib.error
 import urllib.request
@@ -154,6 +157,33 @@ def is_toc_document(href: str, headings: list[str], text: str) -> bool:
     return False
 
 
+ROMAN_VALUES = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+
+
+def roman_to_int(value: str) -> Optional[int]:
+    value = value.upper().strip()
+    if not value or not re.fullmatch(r"[IVXLCDM]+", value):
+        return None
+    total = 0
+    previous = 0
+    for char in reversed(value):
+        current = ROMAN_VALUES[char]
+        if current < previous:
+            total -= current
+        else:
+            total += current
+            previous = current
+    # Reject non-canonical forms such as IIII or IIX.
+    canonical = ""
+    n = total
+    for amount, symbol in ((1000, "M"), (900, "CM"), (500, "D"), (400, "CD"),
+                           (100, "C"), (90, "XC"), (50, "L"), (40, "XL"),
+                           (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")):
+        q, n = divmod(n, amount)
+        canonical += symbol * q
+    return total if canonical == value else None
+
+
 def detect_chapter_marker(headings: list[str], text: str) -> tuple[Optional[str], Optional[str]]:
     """Detect chapter number/title across common EPUB layouts.
 
@@ -229,6 +259,20 @@ def detect_chapter_marker(headings: list[str], text: str) -> tuple[Optional[str]
                 if number is not None:
                     suffix = clean_text(m.group(2) or "")
                     return str(number), (f"Chapter {number}" if not suffix else suffix)
+
+        # Roman-numeral chapter headings, e.g. "Chapter IV" or "IV. The Journey".
+        m = re.fullmatch(r"Chapter\s+([IVXLCDM]+)(?:\s*[:.-]\s*(.*))?", line, re.IGNORECASE)
+        if m:
+            roman_number = roman_to_int(m.group(1))
+            if roman_number is not None:
+                suffix = clean_text(m.group(2) or "")
+                return str(roman_number), (f"Chapter {roman_number}" if not suffix else suffix)
+
+        m = re.fullmatch(r"([IVXLCDM]+)\.\s+(.+)", line, re.IGNORECASE)
+        if m:
+            roman_number = roman_to_int(m.group(1))
+            if roman_number is not None:
+                return str(roman_number), clean_text(m.group(2))
 
         if line.upper() in {"EPILOGUE", "EPILÓGUS"}:
             return "EPILOGUE", "Epilogue"
@@ -309,7 +353,71 @@ def read_epub(epub_path: Path) -> tuple[str, str, list[Chapter]]:
                 "Inspect the EPUB structure or add a custom chapter detector."
             )
 
+        validate_detected_chapters(chapters)
         return book_title, book_language, chapters
+
+
+def validate_detected_chapters(chapters: list[Chapter]) -> None:
+    """Validate the detected chapter sequence without rejecting unusual books.
+
+    Validation is diagnostic: only clearly broken structures raise an error.
+    Gaps, duplicate numbers, and suspiciously short chapters are warnings because
+    some legitimate books use non-contiguous numbering or very short interludes.
+    """
+    numeric = [c for c in chapters if c.number.isdigit()]
+    if not numeric:
+        return
+
+    seen: dict[int, Chapter] = {}
+    duplicates: list[int] = []
+    for chapter in numeric:
+        number = int(chapter.number)
+        if number in seen:
+            duplicates.append(number)
+        else:
+            seen[number] = chapter
+
+    gaps: list[tuple[int, int]] = []
+    ordered = sorted(seen)
+    for a, b in zip(ordered, ordered[1:]):
+        if b > a + 1:
+            gaps.append((a, b))
+
+    warnings: list[str] = []
+    if duplicates:
+        warnings.append("duplicate chapter numbers: " + ", ".join(map(str, sorted(set(duplicates)))))
+    if gaps:
+        warnings.append("chapter-number gaps: " + ", ".join(f"{a}->{b}" for a, b in gaps))
+
+    suspicious = [c for c in chapters if len(c.text.strip()) < 500]
+    if suspicious:
+        warnings.append(
+            "very short detected chapters: " + ", ".join(c.number for c in suspicious)
+        )
+
+    if warnings:
+        print("WARNING: EPUB chapter validation found possible issues:", file=sys.stderr)
+        for warning in warnings:
+            print(f"  - {warning}", file=sys.stderr)
+
+
+def inspect_epub(epub_path: Path) -> tuple[str, str, list[Chapter]]:
+    """Inspect EPUB structure and detected chapters without contacting LM Studio."""
+    book_title, book_language, chapters = read_epub(epub_path)
+    print("=" * 70)
+    print(" EPUB INSPECTION")
+    print("=" * 70)
+    print(f"File:       {epub_path}")
+    print(f"Title:      {book_title or '(unknown)'}")
+    print(f"Language:   {book_language or '(unknown)'}")
+    print(f"Chapters:   {len(chapters)}")
+    print()
+    for index, chapter in enumerate(chapters, 1):
+        kind = "EPILOGUE" if chapter.number == "EPILOGUE" else chapter.number
+        print(f"{index:3d}. {kind:<8} {chapter.title:<45} {len(chapter.text):>9,} chars")
+    print()
+    print("EPUB inspection completed successfully. No LLM request was made.")
+    return book_title, book_language, chapters
 
 
 def find_opf_path(z: zipfile.ZipFile) -> str:
@@ -426,28 +534,60 @@ def chapter_chunks(text: str, context_limit: int, reserved_output_tokens: int, p
 # LM Studio API
 # -----------------------------
 
-def api_request(url: str, payload: dict, timeout: int = 600) -> dict:
+def api_request(
+    url: str,
+    payload: dict,
+    timeout: int = 600,
+    max_retries: int = 3,
+    retry_base_delay: float = 3.0,
+) -> dict:
+    """POST to LM Studio with retries for transient transport/server failures."""
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"LM Studio HTTP {e.code}: {body}") from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(
-            f"Could not connect to LM Studio at {url}. "
-            f"Make sure the local server is running."
-        ) from e
+    last_error: Optional[Exception] = None
+
+    for attempt in range(max_retries + 1):
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                raw = response.read().decode("utf-8")
+                return json.loads(raw)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            # These are commonly transient on a local inference server.
+            retryable = e.code in {408, 425, 429, 500, 502, 503, 504}
+            last_error = RuntimeError(f"LM Studio HTTP {e.code}: {body}")
+            if not retryable or attempt >= max_retries:
+                raise last_error from e
+            reason = f"HTTP {e.code}"
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
+            last_error = e
+            if attempt >= max_retries:
+                if isinstance(e, json.JSONDecodeError):
+                    raise RuntimeError(f"LM Studio returned invalid JSON from {url}: {e}") from e
+                raise RuntimeError(
+                    f"Could not connect to LM Studio at {url}. "
+                    f"Make sure the local server is running. ({e})"
+                ) from e
+            reason = type(e).__name__
+
+        delay = retry_base_delay * (2 ** attempt) + random.uniform(0.0, 1.0)
+        print(
+            f"  [retry {attempt + 1}/{max_retries}] {reason}; "
+            f"waiting {delay:.1f}s...",
+            file=sys.stderr,
+        )
+        time.sleep(delay)
+
+    # Defensive; the loop either returns or raises above.
+    raise RuntimeError(f"LM Studio request failed: {last_error}")
 
 
 def get_loaded_model(base_url: str) -> tuple[str, dict, int, list[str]]:
@@ -532,6 +672,10 @@ def chat(
     send_reasoning: bool = True,
     reasoning_max_tokens: Optional[int] = None,
     final_answer_tokens: int = 512,
+    max_retries: int = 3,
+    retry_base_delay: float = 3.0,
+    context_length: Optional[int] = None,
+    context_safety_margin: int = 256,
 ) -> tuple[str, dict, float]:
     """Call LM Studio and return the final message plus authoritative stats.
 
@@ -547,6 +691,22 @@ def chat(
     # produces no final message, the fallback gets the remaining final-answer
     # allowance. This keeps the combined benchmark budget bounded.
     total_budget = max(1, int(max_tokens))
+    if context_length is not None:
+        prompt_tokens = estimate_tokens(prompt)
+        available = context_length - prompt_tokens - context_safety_margin
+        if available < 256:
+            raise ValueError(
+                f"Prompt is too large for the model context: estimated input={prompt_tokens:,}, "
+                f"context={context_length:,}, safety margin={context_safety_margin:,}."
+            )
+        if total_budget > available:
+            print(
+                f"  Context guard: reducing output budget {total_budget:,} -> {available:,} "
+                f"(estimated input {prompt_tokens:,} / context {context_length:,})",
+                file=sys.stderr,
+            )
+            total_budget = available
+
     if reasoning_max_tokens is not None and reasoning != "off":
         requested_final = max(1, int(final_answer_tokens))
         # Never let the reasoning allowance consume the entire combined budget.
@@ -620,7 +780,7 @@ def chat(
             payload["reasoning"] = reasoning
 
         started = time.perf_counter()
-        response = api_request(url, payload, timeout)
+        response = api_request(url, payload, timeout, max_retries=max_retries, retry_base_delay=retry_base_delay)
         elapsed = time.perf_counter() - started
         content, usage = parse_native(response)
         return content, usage, elapsed
@@ -645,7 +805,7 @@ def chat(
             "stream": False,
         }
         started = time.perf_counter()
-        response = api_request(url, payload, timeout)
+        response = api_request(url, payload, timeout, max_retries=max_retries, retry_base_delay=retry_base_delay)
         elapsed = time.perf_counter() - started
         choices = response.get("choices") or []
         choice = choices[0] if choices else {}
@@ -865,6 +1025,68 @@ def resolve_summary_language(requested: str, source_language: Optional[str]) -> 
     return LANGUAGE_NAMES.get(base, code)
 
 
+def detect_repetition(text: str, min_words: int = 8, max_ngram: int = 12) -> Optional[str]:
+    """Return a warning string when an output contains obvious repeated n-grams."""
+    words = re.findall(r"\S+", text.lower())
+    if len(words) < min_words * 3:
+        return None
+    for n in range(max_ngram, min_words - 1, -1):
+        seen: dict[tuple[str, ...], int] = {}
+        for i in range(0, len(words) - n + 1):
+            gram = tuple(words[i:i+n])
+            previous = seen.get(gram)
+            if previous is not None and i - previous >= n:
+                return f"repeated {n}-word phrase near positions {previous} and {i}"
+            seen[gram] = i
+    return None
+
+
+def check_output_quality(text: str, label: str) -> None:
+    warning = detect_repetition(text)
+    if warning:
+        print(f"WARNING: {label}: {warning}", file=sys.stderr)
+
+
+def validate_summary_language(text: str, expected_language: str) -> tuple[bool, str]:
+    """Lightweight language sanity check without an external dependency.
+
+    This intentionally reports a warning rather than rejecting a summary. It is
+    meant to catch obvious cases such as an English answer when Hungarian was
+    requested, not to perform authoritative linguistic classification.
+    """
+    sample = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿĀ-žА-Яа-я ]", " ", text[:4000]).lower()
+    words = set(sample.split())
+    lang = expected_language.lower()
+    markers = {
+        "hungarian": {"és", "hogy", "nem", "egy", "az", "a", "van", "volt"},
+        "english": {"the", "and", "that", "was", "were", "with", "from", "this"},
+        "german": {"der", "die", "das", "und", "ist", "war", "mit", "von"},
+        "french": {"le", "la", "les", "et", "est", "dans", "avec", "pour"},
+        "spanish": {"el", "la", "los", "las", "y", "es", "con", "para"},
+    }
+    expected_markers = markers.get(lang)
+    if not expected_markers:
+        return True, "unverified"
+    expected_hits = len(words & expected_markers)
+    if not words:
+        return False, "empty"
+    # Only flag when the expected language has no markers at all in a reasonably
+    # long answer. This avoids false positives on short proper-name-heavy text.
+    if len(words) >= 40 and expected_hits == 0:
+        return False, "likely-mismatch"
+    return True, "ok"
+
+
+def check_summary_language(text: str, expected_language: str, label: str) -> None:
+    passed, status = validate_summary_language(text, expected_language)
+    if not passed:
+        print(
+            f"WARNING: {label} may not be in the requested language "
+            f"({expected_language}); heuristic status={status}",
+            file=sys.stderr,
+        )
+
+
 def format_duration(seconds: float) -> str:
     seconds = max(0, int(round(seconds)))
     hours, remainder = divmod(seconds, 3600)
@@ -925,6 +1147,17 @@ ALREADY GENERATED SUMMARY:
 
 CONTINUE FROM EXACTLY HERE. Do not add a heading or preamble; output only the continuation.
 """
+
+
+def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def save_json(path: Path, obj) -> None:
@@ -1026,8 +1259,9 @@ def validate_resume_metadata(
     book_title: str,
     model: str,
     effective_context: int,
+    args=None,
 ) -> None:
-    """Reject an obviously incompatible --resume target instead of mixing runs."""
+    """Reject an incompatible --resume target instead of mixing benchmark runs."""
     info_path = output_dir / "book_info.json"
     if not info_path.exists():
         raise RuntimeError(
@@ -1036,6 +1270,14 @@ def validate_resume_metadata(
         )
 
     info = load_json(info_path)
+    existing_sha = info.get("source_file_sha256")
+    if existing_sha:
+        current_sha = sha256_file(epub_path)
+        if existing_sha != current_sha:
+            raise RuntimeError(
+                f"Cannot resume '{output_dir}': EPUB content changed "
+                f"(existing SHA-256={existing_sha}, current SHA-256={current_sha})."
+            )
     checks = [
         ("source_file", epub_path.name, info.get("source_file")),
         ("book_title", book_title, info.get("book_title")),
@@ -1056,12 +1298,121 @@ def validate_resume_metadata(
             "Use the same --context value as the original run."
         )
 
+    if args is not None:
+        expected = {
+            "summary_language": resolve_summary_language(args.summary_language, info.get("source_language")),
+            "chunk_size_tokens": args.chunk_size,
+            "chunk_overlap": args.chunk_overlap,
+            "temperature": args.temperature,
+            "reasoning_requested": args.reasoning,
+            "min_output_tokens": args.min_output_tokens,
+            "output_ratio": args.output_ratio,
+            "reasoning_output_ratio": args.reasoning_output_ratio,
+            "reasoning_min_output_tokens": args.reasoning_min_output_tokens,
+            "reasoning_max_tokens": args.reasoning_max_tokens,
+            "final_answer_tokens": args.final_answer_tokens,
+            "max_tokens_chunk": args.max_tokens_chunk,
+            "max_tokens_merge": args.max_tokens_merge,
+        }
+        mismatches = []
+        for field, current in expected.items():
+            if field not in info or info.get(field) is None:
+                continue
+            if info.get(field) != current:
+                mismatches.append(
+                    f"{field}: existing={info.get(field)!r}, current={current!r}"
+                )
+        if mismatches:
+            raise RuntimeError(
+                f"Cannot resume '{output_dir}': benchmark parameters changed.\n"
+                + "\n".join(f"  - {m}" for m in mismatches)
+                + "\nUse the original parameters or start a new run."
+            )
+
+
+def dry_run_plan(args) -> None:
+    """Show the deterministic benchmark plan without generating any summaries."""
+    epub_path = Path(args.epub).expanduser().resolve()
+    book_title, book_language, chapters = read_epub(epub_path)
+    if args.max_chapters is not None:
+        if args.max_chapters <= 0:
+            raise ValueError("--max-chapters must be greater than zero")
+        chapters = chapters[:args.max_chapters]
+
+    context = args.context
+    model = "(not queried)"
+    if context is None:
+        try:
+            model, _, detected_context, _ = get_loaded_model(args.base_url)
+            context = detected_context
+        except Exception as exc:
+            context = 32768
+            print(
+                f"WARNING: Could not query LM Studio for context; using fallback {context:,}. "
+                f"Reason: {exc}", file=sys.stderr
+            )
+
+    summary_language = resolve_summary_language(args.summary_language, book_language)
+    print("=" * 70)
+    print(" EPUB LLM BENCHMARK — DRY RUN")
+    print("=" * 70)
+    print(f"Book:       {book_title or '(unknown)'}")
+    print(f"Language:   {book_language or '(unknown)'}")
+    print(f"Summary:    {summary_language}")
+    print(f"Model:      {model}")
+    print(f"Context:    {context:,} tokens")
+    print(f"Chapters:   {len(chapters)}")
+    if args.max_chapters is not None:
+        print(f"Limit:      first {args.max_chapters} chapter(s)")
+    print()
+
+    total_chunks = 0
+    for pos, chapter in enumerate(chapters, 1):
+        output_budget = choose_output_tokens(
+            chapter.text,
+            cap=args.max_tokens_chunk,
+            minimum=(args.reasoning_min_output_tokens if args.reasoning != "off" else args.min_output_tokens),
+            ratio=(args.reasoning_output_ratio if args.reasoning != "off" else args.output_ratio),
+        )
+        chunks = chapter_chunks(
+            chapter.text,
+            context_limit=context,
+            reserved_output_tokens=output_budget,
+            prompt_overhead_tokens=1000,
+            overlap_chars=args.chunk_overlap,
+            chunk_size_tokens=args.chunk_size,
+        )
+        total_chunks += len(chunks)
+        print(
+            f"[{pos:02d}/{len(chapters)}] {chapter.title}: "
+            f"{len(chapter.text):,} chars, ~{estimate_tokens(chapter.text):,} input tokens, "
+            f"{len(chunks)} chunk(s), output budget {output_budget:,}"
+        )
+        if len(chunks) > 1:
+            for i, chunk in enumerate(chunks, 1):
+                print(f"    Chunk {i}/{len(chunks)}: {len(chunk):,} chars, ~{estimate_tokens(chunk):,} tokens")
+
+    print()
+    print(f"Total planned chunks: {total_chunks}")
+    print("Dry run completed. No generation request was sent to LM Studio.")
+
 
 def run(args):
+    if args.max_retries < 0:
+        raise ValueError("--max-retries must be zero or greater")
+    if args.retry_base_delay < 0:
+        raise ValueError("--retry-base-delay must be zero or greater")
     epub_path = Path(args.epub).expanduser().resolve()
     base_output_dir = Path(args.output).expanduser().resolve()
+    epub_sha256 = sha256_file(epub_path)
+    script_path = Path(__file__).resolve()
+    script_sha256 = sha256_file(script_path) if script_path.exists() else None
 
     book_title, book_language, chapters = read_epub(epub_path)
+    if args.max_chapters is not None:
+        if args.max_chapters <= 0:
+            raise ValueError("--max-chapters must be greater than zero")
+        chapters = chapters[:args.max_chapters]
     summary_language = resolve_summary_language(args.summary_language, book_language)
 
     model, model_info, detected_context, allowed_reasoning = get_loaded_model(args.base_url)
@@ -1090,6 +1441,7 @@ def run(args):
             book_title,
             model,
             effective_context,
+            args,
         )
         print(f"Resuming benchmark: {output_dir}")
     else:
@@ -1132,6 +1484,11 @@ def run(args):
                 "source_language": book_language,
                 "summary_language": summary_language,
                 "source_file": epub_path.name,
+                "source_file_sha256": epub_sha256,
+                "script_file": script_path.name,
+                "script_sha256": script_sha256,
+                "created_at": datetime.now().astimezone().isoformat(),
+                "cli_args": vars(args),
                 "model": model,
                 "model_dir": model_dir_name,
                 "run_id": run_id,
@@ -1310,7 +1667,18 @@ def run(args):
                     send_reasoning,
                     args.reasoning_max_tokens,
                     args.final_answer_tokens,
+                    args.max_retries,
+                    args.retry_base_delay,
+                    effective_context,
+                    256,
                 )
+                if looks_like_incomplete_summary(summary, usage, chapter_output_budget):
+                    raise RuntimeError(
+                        f"Chapter {chapter.number} chunk {i}/{len(chunks)} appears truncated "
+                        f"at {chapter_output_budget:,} tokens."
+                    )
+                check_summary_language(summary, summary_language, f"Chapter {chapter.number} chunk {i}")
+                check_output_quality(summary, f"Chapter {chapter.number} chunk {i}")
 
                 save_json(
                     chunk_path,
@@ -1373,7 +1741,18 @@ def run(args):
                 send_reasoning,
                 args.reasoning_max_tokens,
                 args.final_answer_tokens,
+                args.max_retries,
+                args.retry_base_delay,
+                effective_context,
+                256,
             )
+            if looks_like_incomplete_summary(chapter_summary, merge_usage, merge_output_budget):
+                raise RuntimeError(
+                    f"Chapter {chapter.number} merge summary appears truncated "
+                    f"at {merge_output_budget:,} tokens."
+                )
+            check_summary_language(chapter_summary, summary_language, f"Chapter {chapter.number} merge")
+            check_output_quality(chapter_summary, f"Chapter {chapter.number} merge")
 
             total_elapsed += merge_elapsed
             p, c, r = usage_totals(merge_usage)
@@ -1453,7 +1832,14 @@ def run(args):
                 print(f"  Digest {i}/{len(groups)}: ~{inp:,} input, {budget:,} output")
                 digest, usage, elapsed = chat(
                     args.base_url, model, prompt, budget, args.temperature, args.timeout,
-                    effective_reasoning, send_reasoning, args.reasoning_max_tokens, args.final_answer_tokens)
+                    effective_reasoning, send_reasoning, args.reasoning_max_tokens, args.final_answer_tokens,
+                    args.max_retries, args.retry_base_delay, book_context, 1024)
+                if looks_like_incomplete_summary(digest, usage, budget):
+                    raise RuntimeError(
+                        f"Digest level {level} item {i} appears truncated at {budget:,} tokens."
+                    )
+                check_summary_language(digest, summary_language, f"Digest level {level} item {i}")
+                check_output_quality(digest, f"Digest level {level} item {i}")
                 if not digest.strip():
                     raise RuntimeError(f"Digest level {level} item {i} returned no final answer.")
                 out.append(digest.strip())
@@ -1495,14 +1881,17 @@ def run(args):
         print(f"Final book synthesis: ~{final_in:,} input, {final_budget:,} output")
         final_summary, final_usage, final_elapsed=chat(
             args.base_url, model, final_prompt, final_budget, args.temperature, args.timeout,
-            effective_reasoning, send_reasoning, args.reasoning_max_tokens, args.final_answer_tokens)
+            effective_reasoning, send_reasoning, args.reasoning_max_tokens, args.final_answer_tokens,
+            args.max_retries, args.retry_base_delay, book_context, safety_margin)
         if not final_summary.strip():
             raise RuntimeError("Final hierarchical book summary returned no final answer.")
-        completion=int(final_usage.get("completion_tokens",0) or 0)
-        likely_truncated=(completion >= int(final_budget*0.98) and
-                          not re.search(r"[.!?…»”\"]\s*$", final_summary.strip()))
-        if likely_truncated:
-            raise RuntimeError(f"Final hierarchical book summary appears truncated at {final_budget:,} tokens.")
+        check_summary_language(final_summary, summary_language, "Final book summary")
+        check_output_quality(final_summary, "Final book summary")
+        if looks_like_incomplete_summary(final_summary, final_usage, final_budget):
+            raise RuntimeError(
+                f"Final hierarchical book summary appears truncated or incomplete "
+                f"at {final_budget:,} tokens."
+            )
         total_elapsed += final_elapsed
         p,c,r=usage_totals(final_usage)
         total_prompt_tokens += p; total_completion_tokens += c; total_reasoning_tokens += r
@@ -1520,6 +1909,10 @@ def run(args):
             "model": model,
             "model_dir": model_dir_name,
             "run_id": run_id,
+            "source_file": epub_path.name,
+            "source_file_sha256": epub_sha256,
+            "script_file": script_path.name,
+            "script_sha256": script_sha256,
             "model_info": model_info,
             "chapters": len(chapters),
             "completed_chapters": sum(
@@ -1551,11 +1944,36 @@ def run(args):
 
 
 
+class TeeStream:
+    """Write console output to both the terminal and a log file."""
+    def __init__(self, console, logfile):
+        self.console = console
+        self.logfile = logfile
+
+    def write(self, data):
+        self.console.write(data)
+        self.logfile.write(data)
+        self.logfile.flush()
+        return len(data)
+
+    def flush(self):
+        self.console.flush()
+        self.logfile.flush()
+
+    def isatty(self):
+        return self.console.isatty()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Benchmark an LM Studio model by summarizing an EPUB chapter by chapter."
     )
     parser.add_argument("epub", help="Input EPUB file")
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Also write console output to this log file. Relative paths are resolved from the current directory.",
+    )
     parser.add_argument(
         "--output",
         default="./results",
@@ -1670,6 +2088,22 @@ def main():
         help="Requested LM Studio reasoning mode. If unsupported by the loaded model, the script automatically uses a supported mode.",
     )
     parser.add_argument(
+        "--inspect-epub",
+        action="store_true",
+        help="Inspect EPUB structure and detected chapters without contacting LM Studio.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Plan chapters/chunks and budgets without sending any generation request to LM Studio.",
+    )
+    parser.add_argument(
+        "--max-chapters",
+        type=int,
+        default=None,
+        help="Process at most this many detected chapters (useful for short test runs).",
+    )
+    parser.add_argument(
         "--resume",
         default=None,
         help="Resume exactly the specified benchmark run directory. Without this option a new run is always created.",
@@ -1680,17 +2114,50 @@ def main():
         default=900,
         help="HTTP timeout in seconds per request",
     )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=3,
+        help="Maximum retries for transient LM Studio request failures (default: 3)",
+    )
+    parser.add_argument(
+        "--retry-base-delay",
+        type=float,
+        default=3.0,
+        help="Base delay in seconds for exponential retry backoff (default: 3.0)",
+    )
 
     args = parser.parse_args()
 
+    log_handle = None
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
     try:
-        run(args)
+        if args.log_file:
+            log_path = Path(args.log_file).expanduser().resolve()
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_handle = log_path.open("a", encoding="utf-8")
+            print(f"Log file: {log_path}")
+            sys.stdout = TeeStream(original_stdout, log_handle)
+            sys.stderr = TeeStream(original_stderr, log_handle)
+
+        if args.inspect_epub:
+            inspect_epub(Path(args.epub).expanduser().resolve())
+        elif args.dry_run:
+            dry_run_plan(args)
+        else:
+            run(args)
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         sys.exit(130)
     except Exception as e:
         print(f"\nERROR: {e}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        if log_handle is not None:
+            log_handle.close()
 
 
 if __name__ == "__main__":
