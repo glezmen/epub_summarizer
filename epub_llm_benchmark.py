@@ -198,6 +198,38 @@ def detect_chapter_marker(headings: list[str], text: str) -> tuple[Optional[str]
             suffix = clean_text(m.group(2) or "")
             return number, (f"Chapter {number}" if not suffix else suffix)
 
+        # Many older/retail EPUBs spell out chapter numbers, e.g.
+        # "Chapter One", "Chapter Two", ... rather than using digits.
+        # This is especially common in books whose chapter files are named
+        # generically (e.g. part0001_split_002.html).
+        chapter_words = {
+            "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+            "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+            "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+            "fourteen": 14, "fifteen": 15, "sixteen": 16,
+            "seventeen": 17, "eighteen": 18, "nineteen": 19,
+            "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+            "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+        }
+        m = re.fullmatch(
+            r"Chapter\s+([A-Za-z]+(?:[- ]+[A-Za-z]+)?)(?:\s*[:.-]\s*(.*))?",
+            line, re.IGNORECASE,
+        )
+        if m:
+            words = re.sub(r"-", " ", m.group(1)).lower().split()
+            if words and all(word in chapter_words for word in words):
+                number = chapter_words[words[0]]
+                if len(words) == 2 and words[0] in {
+                    "twenty", "thirty", "forty", "fifty", "sixty",
+                    "seventy", "eighty", "ninety",
+                }:
+                    number += chapter_words[words[1]]
+                elif len(words) > 1:
+                    number = None
+                if number is not None:
+                    suffix = clean_text(m.group(2) or "")
+                    return str(number), (f"Chapter {number}" if not suffix else suffix)
+
         if line.upper() in {"EPILOGUE", "EPILÓGUS"}:
             return "EPILOGUE", "Epilogue"
 
