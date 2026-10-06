@@ -994,7 +994,11 @@ ORIGINAL EPUB CHAPTER:
 {source}
 """
 
-BOOK_EVAL_PROMPT = """Evaluate the complete-book summary using the chapter-level reference facts.
+BOOK_EVAL_PROMPT = """Evaluate this complete-book summary against ONE BATCH of chapter-level reference facts.
+
+This is a batched evaluation. Evaluate ONLY the facts included in this batch.
+The complete-book summary is repeated across batches. Do not assume that facts
+from other batches were evaluated here.
 
 Return JSON:
 {
@@ -1010,15 +1014,137 @@ Return JSON:
   "contradictions": ["..."]
 }
 
-Coverage is the proportion of reference facts at each importance level that are correctly represented.
-The reference facts have already been checked against the original EPUB chapter texts. Use those facts as the factual basis. Do not infer unsupported information.
+Coverage is the proportion of reference facts in THIS BATCH at each importance
+level that are correctly represented in the complete-book summary.
+The reference facts were already checked against the original EPUB chapter text.
+Use those facts as the factual basis. Do not infer unsupported information.
 
-REFERENCE FACTS:
+For story_arc_coverage, judge how well the complete-book summary represents the
+important developments represented by THIS BATCH, including turning points,
+consequences, and major causal relationships. This batch-level value will be
+weighted across all batches by the number and importance of facts.
+
+Keep omission/claim lists concise. Do not repeat the entire reference fact set.
+
+REFERENCE FACTS IN THIS BATCH:
 {facts}
 
 LOCAL COMPLETE-BOOK SUMMARY:
 {summary}
 """
+
+
+def build_book_fact_batches(
+    flat_facts: list[dict],
+    summary: str,
+    context_length: int,
+    max_output_tokens: int = 16384,
+    safety_margin: int = 2048,
+) -> list[list[dict]]:
+    """Split book facts into context-safe batches for complete-book evaluation.
+
+    The previous implementation sent every fact from all chapters in one
+    request. For long books this can exceed the evaluator context even when
+    the chapter-level evaluations fit comfortably. Batches are sized from the
+    same conservative character/token estimate used elsewhere in the script.
+    """
+    if not flat_facts:
+        return []
+
+    base_prompt = render_prompt(
+        BOOK_EVAL_PROMPT, facts="", summary=summary
+    )
+    base_tokens = estimate_tokens(base_prompt)
+
+    # Keep a meaningful reserve for JSON output. If the user supplied a lower
+    # explicit cap, use that; otherwise 16k is a conservative planning reserve.
+    output_reserve = max(4096, max_output_tokens if max_output_tokens > 0 else 16384)
+    if context_length:
+        target_fact_tokens = context_length - base_tokens - output_reserve - safety_margin
+    else:
+        # No known context: use a conservative fixed target.
+        target_fact_tokens = 24000
+
+    if target_fact_tokens < 4096:
+        # The summary itself may be large. Use smaller batches rather than
+        # failing immediately; chat_json_with_retry will still enforce the
+        # actual context boundary.
+        target_fact_tokens = max(2048, context_length - base_tokens - 4096 - safety_margin) if context_length else 8192
+
+    batches: list[list[dict]] = []
+    current: list[dict] = []
+    current_tokens = 0
+
+    for fact in flat_facts:
+        fact_tokens = estimate_tokens(json.dumps(fact, ensure_ascii=False)) + 2
+        if current and current_tokens + fact_tokens > target_fact_tokens:
+            batches.append(current)
+            current = []
+            current_tokens = 0
+        current.append(fact)
+        current_tokens += fact_tokens
+
+    if current:
+        batches.append(current)
+    return batches
+
+
+def aggregate_book_eval_batches(batch_results: list[dict]) -> dict:
+    """Aggregate batch-level book evaluations by fact-count weighting."""
+    levels = ("critical", "major", "moderate", "minor")
+    sums = {level: 0.0 for level in levels}
+    counts = {level: 0 for level in levels}
+    weighted_sum = 0.0
+    weighted_count = 0
+    story_sum = 0.0
+    story_weight = 0
+    major_omissions: list[str] = []
+    critical_omissions: list[str] = []
+    unsupported_claims: list[str] = []
+    contradictions: list[str] = []
+
+    for item in batch_results:
+        result = item.get("result") or {}
+        fact_counts = item.get("fact_counts") or {}
+        for level in levels:
+            n = int(fact_counts.get(level, 0) or 0)
+            if n:
+                value = float(result.get(f"{level}_coverage", 0) or 0)
+                sums[level] += value * n
+                counts[level] += n
+        n_total = sum(int(fact_counts.get(level, 0) or 0) for level in levels)
+        wc = float(result.get("weighted_coverage", 0) or 0)
+        if n_total:
+            weighted_sum += wc * n_total
+            weighted_count += n_total
+            story = float(result.get("story_arc_coverage", 0) or 0)
+            # Give critical/major-heavy batches more influence on story arc.
+            story_w = int(fact_counts.get("critical", 0) or 0) * 3 + int(fact_counts.get("major", 0) or 0) * 2 + int(fact_counts.get("moderate", 0) or 0)
+            story_w = max(1, story_w)
+            story_sum += story * story_w
+            story_weight += story_w
+
+        for key, target in (("major_omissions", major_omissions), ("critical_omissions", critical_omissions), ("unsupported_claims", unsupported_claims), ("contradictions", contradictions)):
+            for value in result.get(key, []) or []:
+                value = str(value).strip()
+                if value and value not in target:
+                    target.append(value)
+
+    coverage = {
+        level: (sums[level] / counts[level] if counts[level] else 0.0)
+        for level in levels
+    }
+    weighted = weighted_sum / weighted_count if weighted_count else 0.0
+    return {
+        **coverage,
+        "weighted_coverage": weighted,
+        "story_arc_coverage": story_sum / story_weight if story_weight else 0.0,
+        "major_omissions": major_omissions,
+        "critical_omissions": critical_omissions,
+        "unsupported_claims": unsupported_claims,
+        "contradictions": contradictions,
+        "batch_count": len(batch_results),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1754,9 +1880,94 @@ def run(args):
     # Phase 3: book-level summary evaluation.
     print("\nPhase 3/3: evaluating complete-book summaries...")
     book_level = []
-    # Chapter-level reference facts have already been checked against the EPUB,
-    # so the full book text is not sent again at book level.
-    facts_text = json.dumps(flat_facts, ensure_ascii=False, indent=2)
+    # IMPORTANT: do not send all chapter facts in one prompt. Long books can
+    # easily exceed a 64k evaluator context even though chapter evaluations fit.
+    for item in model_reports:
+        run_dir = Path(item["run_dir"])
+        book_eval_path = eval_root / safe_name(Path(item["run_dir"]).parent.name) / Path(item["run_dir"]).name / "book_evaluation.json"
+        if resuming and book_eval_path.exists():
+            try:
+                cached_book = read_json(book_eval_path)
+                if (isinstance(cached_book, dict) and "result" in cached_book
+                        and int(cached_book.get("schema_version", 0) or 0) >= 2):
+                    book_level.append(cached_book)
+                    print(f"  {item['label']} [CACHED]")
+                    continue
+            except Exception:
+                pass
+
+        summary = read_book_summary(run_dir)
+        if not summary:
+            continue
+
+        batches = build_book_fact_batches(
+            flat_facts,
+            summary,
+            evaluator_context,
+            max_output_tokens=(args.max_tokens_book_eval if args.max_tokens_book_eval > 0 else 16384),
+        )
+        if not batches:
+            continue
+
+        print(f"  {item['label']}: {len(batches)} book-evaluation batches")
+        batch_results = []
+        total_elapsed = 0.0
+        total_prompt = 0
+        total_completion = 0
+
+        for batch_index, batch_facts in enumerate(batches, 1):
+            facts_text = json.dumps(batch_facts, ensure_ascii=False, indent=2)
+            prompt = render_prompt(
+                BOOK_EVAL_PROMPT,
+                facts=facts_text,
+                summary=summary,
+            )
+            budget_cap = args.max_tokens_book_eval if args.max_tokens_book_eval > 0 else 16384
+            budget = max(args.min_output_tokens, dynamic_budget(
+                prompt, budget_cap, args.min_output_tokens
+            ))
+            parsed, usage, elapsed, _ = chat_json_with_retry(
+                args.evaluator, args.base_url, evaluator_model, SYSTEM, prompt,
+                budget, args.max_tokens_book_eval, args.temperature, args.reasoning, args.timeout,
+                context_length=evaluator_context, schema=BOOK_EVAL_SCHEMA,
+                label=f"Book evaluation [{batch_index}/{len(batches)}]",
+            )
+            fact_counts = {level: 0 for level in ("critical", "major", "moderate", "minor")}
+            for fact in batch_facts:
+                level = str(fact.get("importance", "minor"))
+                if level in fact_counts:
+                    fact_counts[level] += 1
+            batch_result = {
+                "batch": batch_index,
+                "fact_count": len(batch_facts),
+                "fact_counts": fact_counts,
+                "result": parsed if isinstance(parsed, dict) else {},
+                "elapsed_seconds": elapsed,
+                "usage": usage,
+            }
+            batch_results.append(batch_result)
+            total_elapsed += elapsed
+            total_prompt += int(usage.get("prompt_tokens", 0) or 0)
+            total_completion += int(usage.get("completion_tokens", 0) or 0)
+            print(f"    batch {batch_index}/{len(batches)}: {len(batch_facts)} facts")
+
+        aggregated = aggregate_book_eval_batches(batch_results)
+        result = {
+            "model": item["model"],
+            "run_dir": item["run_dir"],
+            "schema_version": 2,
+            "result": aggregated,
+            "batch_count": len(batch_results),
+            "batches": batch_results,
+            "elapsed_seconds": total_elapsed,
+            "usage": {
+                "prompt_tokens": total_prompt,
+                "completion_tokens": total_completion,
+            },
+        }
+        book_level.append(result)
+        save_json(book_eval_path, result)
+
     for item in model_reports:
         run_dir = Path(item["run_dir"])
         book_eval_path = eval_root / safe_name(Path(item["run_dir"]).parent.name) / Path(item["run_dir"]).name / "book_evaluation.json"
