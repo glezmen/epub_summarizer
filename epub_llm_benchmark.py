@@ -29,6 +29,7 @@ import hashlib
 import contextlib
 import html
 import re
+import posixpath
 import sys
 import random
 import time
@@ -206,9 +207,20 @@ def detect_chapter_marker(headings: list[str], text: str) -> tuple[Optional[str]
         m = re.fullmatch(r"(?:chapter\s+)?(\d+)(?:\s*[:.-]\s*(.*))?", value, re.IGNORECASE)
         if m:
             number = m.group(1)
+            # Large numbers in headings are commonly IDs, page references, or
+            # incidental numeric labels, not plausible novel chapter numbers.
+            if int(number) > 500:
+                continue
             title_suffix = clean_text(m.group(2) or "")
             title = f"Chapter {number}" if not title_suffix else title_suffix
             return number, title
+
+        m = re.fullmatch(r"(?:FEJEZET\s+(\d+)|(\d+)\.?\s+FEJEZET)(?:\s*[:.-]\s*(.*))?", value, re.IGNORECASE)
+        if m:
+            number = m.group(1) or m.group(2)
+            if int(number) <= 500:
+                suffix = clean_text(m.group(3) or "")
+                return number, (suffix or f"{number}. fejezet")
         if value.upper() in {"EPILOGUE", "EPILÓGUS"}:
             return "EPILOGUE", "Epilogue"
 
@@ -218,6 +230,14 @@ def detect_chapter_marker(headings: list[str], text: str) -> tuple[Optional[str]
     lines = [clean_text(line) for line in text.splitlines()]
     lines = [line for line in lines if line]
     for line in lines[:80]:
+        # Hungarian chapter headings used by localized EPUBs.
+        m = re.fullmatch(r"(?:FEJEZET\s+(\d+)|(\d+)\.?\s+FEJEZET)(?:\s*[:.-]\s*(.*))?", line, re.IGNORECASE)
+        if m:
+            number = m.group(1) or m.group(2)
+            if int(number) <= 500:
+                suffix = clean_text(m.group(3) or "")
+                return number, (suffix or f"{number}. fejezet")
+
         m = re.fullmatch(r"(\d+)\.\s+(.+)", line)
         if m:
             return m.group(1), clean_text(m.group(2))
@@ -297,9 +317,19 @@ def parse_embedded_chapter_heading(line: str) -> tuple[Optional[str], Optional[s
     if not value:
         return None, None
 
+    # Hungarian localized headings: "FEJEZET 12" or "12. FEJEZET".
+    m = re.fullmatch(r"(?:FEJEZET\s+(\d+)|(\d+)\.?\s+FEJEZET)(?:\s*[:.-]\s*(.*))?", value, re.IGNORECASE)
+    if m:
+        number = m.group(1) or m.group(2)
+        if int(number) <= 500:
+            suffix = clean_text(m.group(3) or "")
+            return number, (suffix or f"{number}. fejezet")
+
     m = re.fullmatch(r"CHAPTER\s+(\d+)(?:\s*[:.-]\s*(.*))?", value, re.IGNORECASE)
     if m:
         number = m.group(1)
+        if int(number) > 500:
+            return None, None
         suffix = clean_text(m.group(2) or "")
         return number, (suffix or f"Chapter {number}")
 
@@ -380,6 +410,50 @@ def read_epub(epub_path: Path) -> tuple[str, str, list[Chapter]]:
         for itemref in root.findall(f".//{{{OPF_NS}}}spine/{{{OPF_NS}}}itemref"):
             spine.append(itemref.attrib["idref"])
 
+        # Use the EPUB's NCX table of contents as the authoritative chapter
+        # map when it provides a clean, sequential numbered chapter list.
+        # This is important for editions where each chapter is a separate HTML
+        # file but the body begins with running page numbers (which must not be
+        # mistaken for chapter numbers).
+        toc_chapter_map: dict[str, str] = {}
+        opf_dir_posix = posixpath.dirname(opf_path)
+        ncx_paths = [
+            posixpath.normpath(posixpath.join(opf_dir_posix, item["href"]))
+            for item in manifest.values()
+            if item.get("media_type") == "application/x-dtbncx+xml"
+            or item.get("href", "").lower().endswith(".ncx")
+        ]
+        for ncx_path in ncx_paths:
+            try:
+                ncx_root = ET.fromstring(z.read(ncx_path))
+            except (KeyError, ET.ParseError):
+                continue
+            ncx_ns = {"ncx": "http://www.daisy.org/z3986/2005/ncx/"}
+            candidate_map: dict[str, str] = {}
+            numeric_labels: list[int] = []
+            for navpoint in ncx_root.findall(".//ncx:navPoint", ncx_ns):
+                label_el = navpoint.find("./ncx:navLabel/ncx:text", ncx_ns)
+                content_el = navpoint.find("./ncx:content", ncx_ns)
+                if label_el is None or content_el is None:
+                    continue
+                label = clean_text("".join(label_el.itertext()))
+                src = content_el.attrib.get("src", "").split("#", 1)[0]
+                if not src:
+                    continue
+                target = posixpath.normpath(posixpath.join(posixpath.dirname(ncx_path), src))
+                if label.isdigit():
+                    numeric_labels.append(int(label))
+                    candidate_map[target] = label
+                elif label.upper() in {"EPILOGUE", "EPILÓGUS"}:
+                    candidate_map[target] = "EPILOGUE"
+
+            # Only trust the NCX override when it is a substantial, strictly
+            # sequential chapter list (e.g. 1..47), avoiding ordinary numeric
+            # TOC entries or malformed navigation documents.
+            if len(numeric_labels) >= 5 and numeric_labels == list(range(1, len(numeric_labels) + 1)):
+                toc_chapter_map = candidate_map
+                break
+
         book_title = ""
         book_language = ""
         title_el = root.find(f".//{{{DC_NS}}}title")
@@ -423,6 +497,19 @@ def read_epub(epub_path: Path) -> tuple[str, str, list[Chapter]]:
             # Some EPUBs put the table of contents in the spine and use a
             # generic filename.  Filter it before chapter-number detection.
             if is_toc_document(full_path, headings, text):
+                continue
+
+            # When a clean NCX chapter map exists, trust its chapter number
+            # and ignore misleading leading page numbers or unrelated numbers
+            # found in the chapter body. The OPF spine loop already preserves
+            # reading order; front matter, part pages and bonus content without
+            # numeric/epilogue NCX labels are intentionally excluded.
+            toc_label = toc_chapter_map.get(posixpath.normpath(full_path))
+            if toc_label is not None:
+                if toc_label == "EPILOGUE":
+                    chapters.append(Chapter("EPILOGUE", "Epilogue", full_path, text))
+                else:
+                    chapters.append(Chapter(toc_label, f"Chapter {toc_label}", full_path, text))
                 continue
 
             # Some EPUBs store the entire novel in ONE XHTML file. In that
@@ -506,7 +593,7 @@ def inspect_epub(epub_path: Path) -> tuple[str, str, list[Chapter]]:
     print()
     for index, chapter in enumerate(chapters, 1):
         kind = "EPILOGUE" if chapter.number == "EPILOGUE" else chapter.number
-        print(f"{index:3d}. {kind:<8} {chapter.title:<45} {len(chapter.text):>9,} chars")
+        print(f"{index:3d}. {kind:<8} {chapter.title:<45} {len(chapter.text):>9,} chars  [{chapter.href}]")
     print()
     print("EPUB inspection completed successfully. No LLM request was made.")
     return book_title, book_language, chapters
@@ -2002,7 +2089,11 @@ def run(args):
                 # For hierarchical synthesis, do not impose an arbitrary digest
                 # output cap. Let the model generate as much as it needs, limited
                 # only by the remaining context window.
-                budget = max(256, book_context - inp - safety_margin)
+                # Do not turn all remaining context into an output budget.
+                # Extremely large output budgets encourage runaway/repetitive
+                # summaries and can make the final synthesis unusably large.
+                digest_output_cap = 8192
+                budget = min(digest_output_cap, max(256, book_context - inp - safety_margin))
                 print(f"  Digest {i}/{len(groups)}: ~{inp:,} input, {budget:,} output")
                 digest, usage, elapsed = chat(
                     args.base_url, model, prompt, budget, args.temperature, args.timeout,
@@ -2051,7 +2142,11 @@ def run(args):
         final_in=estimate_tokens(final_prompt)
         # No fixed final-summary token cap: the only hard limit is the model
         # context window after accounting for the prompt and safety margin.
-        final_budget = max(256, book_context - final_in - safety_margin)
+        # Keep a generous but finite final-summary budget. The context window
+        # is a hard ceiling, not a reason to allocate tens of thousands of
+        # output tokens to a summary.
+        final_output_cap = 16384
+        final_budget = min(final_output_cap, max(256, book_context - final_in - safety_margin))
         print(f"Final book synthesis: ~{final_in:,} input, {final_budget:,} output")
         final_summary, final_usage, final_elapsed=chat(
             args.base_url, model, final_prompt, final_budget, args.temperature, args.timeout,
@@ -2202,7 +2297,7 @@ def main():
         "--max-tokens-book",
         type=int,
         default=None,
-        help="Deprecated: ignored for hierarchical whole-book synthesis; output is limited only by the model context window.",
+        help="Deprecated: ignored for hierarchical whole-book synthesis; digest/final output use bounded internal caps.",
     )
     parser.add_argument(
         "--max-book-summary-passes",
