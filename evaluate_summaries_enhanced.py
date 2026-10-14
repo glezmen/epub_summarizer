@@ -650,21 +650,23 @@ def chat_json_with_retry(
     prompt_tokens = estimate_tokens(system + "\n\n" + user)
     safety_margin = 1024
 
-    if context_length and context_length > prompt_tokens + safety_margin:
+    if context_length > 0:
+        # A known context size is authoritative. If the prompt leaves no room
+        # for output, fail clearly rather than silently ignoring the limit.
         context_budget = context_length - prompt_tokens - safety_margin
+        if context_budget <= 0:
+            raise RuntimeError(
+                f"{label}: no usable output context remains "
+                f"(prompt ~{prompt_tokens:,} tokens, context={context_length:,}). "
+                "Reduce the input prompt or use a model with a larger context."
+            )
+        effective_max = min(max_budget, context_budget) if max_budget > 0 else context_budget
     else:
-        context_budget = 0
-
-    if max_budget > 0:
-        effective_max = min(max_budget, context_budget) if context_budget else max_budget
-    else:
-        effective_max = context_budget
-
-    if effective_max <= 0:
-        raise RuntimeError(
-            f"{label}: no usable output context remains "
-            f"(prompt ~{prompt_tokens:,} tokens, context={context_length:,})."
-        )
+        # External evaluators such as Claude Code do not expose a reliable
+        # context length through this CLI. A value of 0 means UNKNOWN, not a
+        # zero-token context. Use the explicit output cap, or a conservative
+        # 16k cap for automatic mode; retries remain bounded by this value.
+        effective_max = max_budget if max_budget > 0 else max(initial_budget, 16384)
 
     budget = min(max(1, initial_budget), effective_max)
     total_elapsed = 0.0
